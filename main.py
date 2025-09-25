@@ -280,86 +280,60 @@ class OpenAITTSProvider(TTSProvider):
     def __init__(self):
         if not OPENAI_API_KEY:
             raise RuntimeError("OPENAI_API_KEY missing for OpenAI TTS")
-        from openai import OpenAI
-        self.client = OpenAI()
+        # 不再依賴 openai SDK 的 audio.speech.create 參數型別；改走 REST
+        import requests  # 確保 Render 映像有 requests（一般都有）
+        self.requests = requests
         self.model  = OPENAI_TTS_MODEL
         self.voice  = OPENAI_TTS_VOICE
+        # 可選：支援自訂 base url（例如企業代理）
+        self.base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
     def synth(self, text: str, sr: int = 16000) -> bytes:
         """
-        兼容多版 OpenAI Python SDK：
-        依序嘗試幾種已存在過的參數寫法，拿到 bytes 就回傳。
-        一律要求 WAV（16-bit mono）與指定取樣率 sr。
+        使用 REST API 呼叫 /v1/audio/speech，回傳 WAV bytes。
+        先嘗試 body 的 'format' 欄位；若非 200 再退而求其次用 'response_format'。
         """
-        # --- 嘗試 1：新版常見寫法：format= / sample_rate=
-        try:
-            r = self.client.audio.speech.create(
-                model=self.model,
-                voice=self.voice,
-                input=text,
-                format="wav",             # 某些版本接受 format
-                sample_rate=sr,           # 某些版本接受 sample_rate
-            )
-            data = getattr(r, "content", None)
-            if data: return data
-            reader = getattr(r, "read", None)
-            if callable(reader): return reader()
-        except TypeError:
-            pass
-        except Exception:
-            pass
+        url = f"{self.base_url.rstrip('/')}/audio/speech"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
 
-        # --- 嘗試 2：有些版用 response_format=（而非 format=）
-        try:
-            r = self.client.audio.speech.create(
-                model=self.model,
-                voice=self.voice,
-                input=text,
-                response_format="wav",    # 用 response_format 指定格式
-                sample_rate=sr,
-            )
-            data = getattr(r, "content", None)
-            if data: return data
-            reader = getattr(r, "read", None)
-            if callable(reader): return reader()
-        except TypeError:
-            pass
-        except Exception:
-            pass
+        # 嘗試 1：使用 'format'
+        payload1 = {
+            "model": self.model,       # 例：gpt-4o-mini-tts
+            "input": text,
+            "voice": self.voice,       # 例：alloy
+            "format": "wav",
+            "sample_rate": sr,         # 多數情況忽略也可；留著無害
+        }
+        r = self.requests.post(url, headers=headers, json=payload1, timeout=30)
+        if r.status_code == 200 and r.headers.get("Content-Type","").startswith("audio/"):
+            return r.content
 
-        # --- 嘗試 3：有些版把音訊參數包在 audio={}
-        try:
-            r = self.client.audio.speech.create(
-                model=self.model,
-                voice=self.voice,
-                input=text,
-                audio={"format": "wav", "sample_rate": sr},  # audio 物件
-            )
-            data = getattr(r, "content", None)
-            if data: return data
-            reader = getattr(r, "read", None)
-            if callable(reader): return reader()
-        except TypeError:
-            pass
-        except Exception:
-            pass
+        # 嘗試 2：使用 'response_format'
+        payload2 = {
+            "model": self.model,
+            "input": text,
+            "voice": self.voice,
+            "response_format": "wav",
+            "sample_rate": sr,
+        }
+        r2 = self.requests.post(url, headers=headers, json=payload2, timeout=30)
+        if r2.status_code == 200 and r2.headers.get("Content-Type","").startswith("audio/"):
+            return r2.content
 
-        # --- 嘗試 4：串流介面（with_streaming_response）
+        # 兩次都不是 200 → 回傳錯誤給上層（你的 /tts 路由會改回 beep 並附 X-TTS-Error）
         try:
-            with self.client.audio.speech.with_streaming_response.create(
-                model=self.model,
-                voice=self.voice,
-                input=text,
-                # 同樣嘗試不同鍵名；串流介面通常接受 format
-                format="wav",
-                sample_rate=sr,
-            ) as resp:
-                return resp.read()
+            err_text = r.text if r is not None else ""
         except Exception:
-            pass
+            err_text = ""
+        try:
+            err_text2 = r2.text if r2 is not None else ""
+        except Exception:
+            err_text2 = ""
+        raise RuntimeError(f"OpenAI REST TTS failed: {r.status_code} {err_text} | {r2.status_code} {err_text2}")
 
-        # 全部嘗試都失敗 → 交給上層（/tts 路由會回 beep 並在 header 帶錯誤）
-        raise RuntimeError("OpenAI TTS parameter compatibility failed (format/response_format/audio variants)")
 
 
 
