@@ -13,6 +13,7 @@ from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
 
 # ============= 環境參數（可在 PowerShell/cmd 或 .env 設定） =============
 # 供應商選項：
@@ -42,6 +43,12 @@ RAG_TOP_K         = int(os.getenv("RAG_TOP_K", "4"))
 LANG_HINT         = os.getenv("LANG_HINT", "zh")     # STT 語言提示
 REPLY_LANG        = os.getenv("REPLY_LANG", "zh-TW") # LLM 回覆語言偏好
 
+# TTS 設定（NEW）
+PROVIDER_TTS   = os.getenv("PROVIDER_TTS", "openai")  # openai | piper
+OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")  # OpenAI TTS 型號
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy")            # 聲音樣式
+PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "")  # 例：/models/zh_CN-piper-medium.onnx
+
 
 # ============= FastAPI 初始化與 CORS =============
 app = FastAPI(title="ESP32 Voice Backend (Pluggable)", version="1.0")
@@ -64,6 +71,13 @@ class RAGProvider:
 class LLMProvider:
     def chat(self, user_text: str, context_chunks: List[str], lang: str = "zh-TW") -> str:
         raise NotImplementedError
+    
+class TTSProvider:
+    def synth(self, text: str, sr: int = 16000) -> bytes:
+        """回傳整段 WAV（bytes）。"""
+        raise NotImplementedError
+    
+
 
 
 # ============= STT Providers =============
@@ -258,16 +272,83 @@ class OpenAILLM(LLMProvider):
             max_tokens=300,
         )
         return r.choices[0].message.content.strip()
+    
+
+# ============= TTS Provider（NEW） =============
+# A) OpenAI TTS（雲端，最簡單）
+class OpenAITTSProvider(TTSProvider):
+    def __init__(self):
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY missing for OpenAI TTS")
+        from openai import OpenAI
+        self.client = OpenAI()
+        self.model  = OPENAI_TTS_MODEL
+        self.voice  = OPENAI_TTS_VOICE
+
+    def synth(self, text: str, sr: int = 16000) -> bytes:
+        # 多數 SDK 會提供 wav / pcm 選項；這裡以 "wav" 為例
+        try:
+            # 新版 SDK（可能支援 streaming），先試一次性取回全部 bytes
+            r = self.client.audio.speech.create(
+                model=self.model,
+                voice=self.voice,
+                input=text,
+                format="wav",              # 要 WAV（含 44B header）
+                sample_rate=sr             # 由 ESP32 端自動跟隨
+            )
+            # 有些 SDK 直接回 bytes；有些回物件需 .read()/.content
+            return getattr(r, "content", None) or getattr(r, "read", lambda: b"")()
+        except Exception:
+            # 相容舊 SDK（with_streaming_response）
+            with self.client.audio.speech.with_streaming_response.create(
+                model=self.model, voice=self.voice, input=text, format="wav", sample_rate=sr
+            ) as resp:
+                return resp.read()
+
+
+# B) Piper（本地，離線）
+class PiperTTSProvider(TTSProvider):
+    def __init__(self):
+        if not PIPER_MODEL_PATH or not os.path.exists(PIPER_MODEL_PATH):
+            raise RuntimeError("Piper model not found; set PIPER_MODEL_PATH")
+        # 依你安裝的封裝而定，以下示意常見 API
+        # pip install piper-phonemize piper-tts 或相容套件
+        from piper import PiperVoice
+        self.voice = PiperVoice.load(PIPER_MODEL_PATH)
+
+    def synth(self, text: str, sr: int = 16000) -> bytes:
+        # Piper 預設會回 PCM/或直接寫檔；這裡將其包成 WAV
+        import wave, struct
+        import numpy as np
+        # 產生 16-bit mono PCM（numpy int16）
+        pcm = self.voice.synthesize(text, length_scale=1.0)  # 取得 float32 PCM（依套件版本不同）
+        if pcm.dtype != np.int16:
+            # 轉 16-bit（簡單限幅）
+            x = np.clip(pcm, -1.0, 1.0)
+            pcm16 = (x * 32767.0).astype(np.int16)
+        else:
+            pcm16 = pcm
+
+        # 封裝 WAV（16-bit mono）
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(pcm16.tobytes())
+        return buf.getvalue()
+
 
 
 # ============= Provider 載入器 =============
 stt_provider: Optional[STTProvider] = None
 rag_provider: Optional[RAGProvider] = None
 llm_provider: Optional[LLMProvider] = None
+tts_provider: Optional[TTSProvider] = None
 
 @app.on_event("startup")
 def load_providers():
-    global stt_provider, rag_provider, llm_provider
+    global stt_provider, rag_provider, llm_provider, tts_provider
 
     # STT
     if PROVIDER_STT == "local":
@@ -293,6 +374,14 @@ def load_providers():
     else:
         raise RuntimeError(f"Unknown PROVIDER_LLM: {PROVIDER_LLM}")
 
+    # TTS（NEW）
+    if PROVIDER_TTS == "openai":
+        tts_provider = OpenAITTSProvider()
+    elif PROVIDER_TTS == "piper":
+        tts_provider = PiperTTSProvider()
+    else:
+        raise RuntimeError(f"Unknown PROVIDER_TTS: {PROVIDER_TTS}")
+
 
 # ============= 路由 =============
 @app.get("/health")
@@ -302,6 +391,11 @@ def health():
         "stt": PROVIDER_STT,
         "rag": PROVIDER_RAG,
         "llm": PROVIDER_LLM,
+        "tts": dict(
+            provider=PROVIDER_TTS,
+            openai=dict(model=OPENAI_TTS_MODEL, voice=OPENAI_TTS_VOICE, has_key=bool(OPENAI_API_KEY)),
+            piper=dict(model_path=bool(PIPER_MODEL_PATH)),
+        ),
         "whisper": dict(model=WHISPER_MODEL, device=WHISPER_DEVICE, compute=WHISPER_COMPUTE),
         "openai": dict(
             chat_model=OPENAI_CHAT_MODEL,
@@ -344,7 +438,26 @@ def chat(body: ChatIn):
         return {"ok": True, "reply": reply, "ctx_used": len(chunks)}
     except Exception as e:
         raise HTTPException(500, f"Chat error: {e}")
+    
 
+class TTSIn(BaseModel):
+    text: str
+    sr: Optional[int] = 16000
+
+
+@app.post("/tts")
+def tts(body: TTSIn):
+    if tts_provider is None:
+        raise HTTPException(500, "TTS provider not loaded")
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(400, "empty text")
+    sr = int(body.sr or 16000)
+    try:
+        audio_bytes = tts_provider.synth(text, sr=sr)   # 直接拿到「含 44B header 的 WAV」
+        return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/wav")
+    except Exception as e:
+        raise HTTPException(500, f"TTS error: {e}")
 
 # ============= 開發啟動（直接 python main.py 時） =============
 if __name__ == "__main__":
