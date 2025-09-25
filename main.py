@@ -34,6 +34,7 @@ OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_EMBED_MODEL= os.getenv("EMBED_MODEL", "text-embedding-3-small")
 OPENAI_STT_MODEL  = os.getenv("OPENAI_STT_MODEL", "whisper-1")  # 或 gpt-4o-mini-transcribe
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
 # RAG 知識來源（會讀這個資料夾下的 .txt/.md/.mdx/.html 檔）
 KNOWLEDGE_DIR     = os.getenv("KNOWLEDGE_DIR", "./knowledge")
@@ -276,64 +277,62 @@ class OpenAILLM(LLMProvider):
 
 # ============= TTS Provider（NEW） =============
 # A) OpenAI TTS（雲端，最簡單）
+
 class OpenAITTSProvider(TTSProvider):
     def __init__(self):
         if not OPENAI_API_KEY:
             raise RuntimeError("OPENAI_API_KEY missing for OpenAI TTS")
-        # 不再依賴 openai SDK 的 audio.speech.create 參數型別；改走 REST
-        import requests  # 確保 Render 映像有 requests（一般都有）
-        self.requests = requests
-        self.model  = OPENAI_TTS_MODEL
-        self.voice  = OPENAI_TTS_VOICE
-        # 可選：支援自訂 base url（例如企業代理）
-        self.base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        import requests
+        self.http = requests
+        self.model  = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+        self.voice  = os.getenv("OPENAI_TTS_VOICE", "alloy")
+        self.base   = OPENAI_BASE_URL.rstrip("/")
 
-    def synth(self, text: str, sr: int = 16000) -> bytes:
-        """
-        使用 REST API 呼叫 /v1/audio/speech，回傳 WAV bytes。
-        先嘗試 body 的 'format' 欄位；若非 200 再退而求其次用 'response_format'。
-        """
-        url = f"{self.base_url.rstrip('/')}/audio/speech"
+    def _post_speech(self, payload: dict):
+        url = f"{self.base}/audio/speech"
         headers = {
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "Content-Type": "application/json",
         }
+        return self.http.post(url, headers=headers, json=payload, timeout=45)
 
-        # 嘗試 1：使用 'format'
-        payload1 = {
-            "model": self.model,       # 例：gpt-4o-mini-tts
-            "input": text,
-            "voice": self.voice,       # 例：alloy
-            "format": "wav",
-            "sample_rate": sr,         # 多數情況忽略也可；留著無害
-        }
-        r = self.requests.post(url, headers=headers, json=payload1, timeout=30)
-        if r.status_code == 200 and r.headers.get("Content-Type","").startswith("audio/"):
-            return r.content
+    def synth(self, text: str, sr: int = 16000) -> bytes:
+        """
+        走 REST API：
+        1) 先用你設定的 model（預設 gpt-4o-mini-tts）
+        2) 若失敗，依序嘗試其它常見可用模型：tts-1, gpt-4o-audio-preview
+        3) 針對參數鍵名再做兩輪：format / response_format
+        任一成功就回 bytes；否則丟出詳盡錯訊。
+        """
+        models_try = [self.model, "tts-1", "gpt-4o-audio-preview"]
+        errs = []
 
-        # 嘗試 2：使用 'response_format'
-        payload2 = {
-            "model": self.model,
-            "input": text,
-            "voice": self.voice,
-            "response_format": "wav",
-            "sample_rate": sr,
-        }
-        r2 = self.requests.post(url, headers=headers, json=payload2, timeout=30)
-        if r2.status_code == 200 and r2.headers.get("Content-Type","").startswith("audio/"):
-            return r2.content
+        for m in models_try:
+            # 方案 A：format
+            r = self._post_speech({
+                "model": m,
+                "input": text,
+                "voice": self.voice,
+                "format": "wav",
+                "sample_rate": sr,
+            })
+            if r.status_code == 200 and r.headers.get("Content-Type","").startswith("audio/"):
+                return r.content
+            errs.append(f"[{m}/format] {r.status_code} {r.text[:180]}")
 
-        # 兩次都不是 200 → 回傳錯誤給上層（你的 /tts 路由會改回 beep 並附 X-TTS-Error）
-        try:
-            err_text = r.text if r is not None else ""
-        except Exception:
-            err_text = ""
-        try:
-            err_text2 = r2.text if r2 is not None else ""
-        except Exception:
-            err_text2 = ""
-        raise RuntimeError(f"OpenAI REST TTS failed: {r.status_code} {err_text} | {r2.status_code} {err_text2}")
+            # 方案 B：response_format
+            r2 = self._post_speech({
+                "model": m,
+                "input": text,
+                "voice": self.voice,
+                "response_format": "wav",
+                "sample_rate": sr,
+            })
+            if r2.status_code == 200 and r2.headers.get("Content-Type","").startswith("audio/"):
+                return r2.content
+            errs.append(f"[{m}/response_format] {r2.status_code} {r2.text[:180]}")
 
+        raise RuntimeError(" | ".join(errs))
 
 
 
@@ -489,6 +488,7 @@ def chat(body: ChatIn):
     
 
 
+
 class TTSIn(BaseModel):
     text: str
     sr: Optional[int] = 16000
@@ -497,24 +497,32 @@ class TTSIn(BaseModel):
 def tts(body: TTSIn):
     text = (body.text or "").strip()
     if not text:
-        # 仍舊回 400（前端不該送空字串）
         raise HTTPException(400, "empty text")
     sr = int(body.sr or 16000)
+
+    # 先預備一個 resp 物件，方便附加 header
+    out_bytes: bytes = b""
+    impl = "rest"
+    err  = ""
+
     try:
         if tts_provider is None:
-            # 沒初始化成功（例如 OPENAI_API_KEY 缺），先回 beep，讓硬體鏈路可驗證
-            audio_bytes = make_beep_wav(sr=sr, dur_s=0.8, freq=1000.0)
-            return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/wav")
-        # 正常走 provider
-        audio_bytes = tts_provider.synth(text, sr=sr)
-        return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/wav")
+            impl = "beep"
+            out_bytes = make_beep_wav(sr=sr, dur_s=0.8, freq=1000.0)
+        else:
+            out_bytes = tts_provider.synth(text, sr=sr)
     except Exception as e:
-        # OpenAI 等報錯時，仍回一段 WAV（不同頻率），並把錯誤放在 header 方便你用 curl 看
-        audio_bytes = make_beep_wav(sr=sr, dur_s=0.8, freq=600.0)
-        resp = StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/wav")
-        resp.headers["X-TTS-Error"] = str(e)[:200]
-        return resp
+        impl = "beep"
+        err  = str(e)
+        out_bytes = make_beep_wav(sr=sr, dur_s=0.8, freq=600.0)
 
+    resp = StreamingResponse(io.BytesIO(out_bytes), media_type="audio/wav")
+    resp.headers["X-TTS-Impl"] = impl
+    if err:
+        resp.headers["X-TTS-Error"] = err[:300]
+    return resp
+
+# （可選）GET /tts 方便瀏覽器測
 @app.get("/tts")
 def tts_get(text: Optional[str] = "", sr: Optional[int] = 16000):
     t = (text or "").strip() or "系統測試音"
