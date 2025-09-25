@@ -339,6 +339,23 @@ class PiperTTSProvider(TTSProvider):
         return buf.getvalue()
 
 
+# ============= 加入一個產生 beep WAV 的小工具 =============
+# --- fallback: 產生一段 0.8 秒 1kHz 的 16-bit mono WAV ---
+def make_beep_wav(sr: int = 16000, dur_s: float = 0.8, freq: float = 1000.0) -> bytes:
+    import math, io, wave, struct
+    n = int(sr * dur_s)
+    amp = 0.4
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        for i in range(n):
+            v = int(amp * 32767 * math.sin(2*math.pi*freq*i/sr))
+            wf.writeframes(struct.pack("<h", v))
+    return buf.getvalue()
+
+
 
 # ============= Provider 載入器 =============
 stt_provider: Optional[STTProvider] = None
@@ -440,24 +457,38 @@ def chat(body: ChatIn):
         raise HTTPException(500, f"Chat error: {e}")
     
 
+
 class TTSIn(BaseModel):
     text: str
     sr: Optional[int] = 16000
 
-
 @app.post("/tts")
 def tts(body: TTSIn):
-    if tts_provider is None:
-        raise HTTPException(500, "TTS provider not loaded")
     text = (body.text or "").strip()
     if not text:
+        # 仍舊回 400（前端不該送空字串）
         raise HTTPException(400, "empty text")
     sr = int(body.sr or 16000)
     try:
-        audio_bytes = tts_provider.synth(text, sr=sr)   # 直接拿到「含 44B header 的 WAV」
+        if tts_provider is None:
+            # 沒初始化成功（例如 OPENAI_API_KEY 缺），先回 beep，讓硬體鏈路可驗證
+            audio_bytes = make_beep_wav(sr=sr, dur_s=0.8, freq=1000.0)
+            return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/wav")
+        # 正常走 provider
+        audio_bytes = tts_provider.synth(text, sr=sr)
         return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/wav")
     except Exception as e:
-        raise HTTPException(500, f"TTS error: {e}")
+        # OpenAI 等報錯時，仍回一段 WAV（不同頻率），並把錯誤放在 header 方便你用 curl 看
+        audio_bytes = make_beep_wav(sr=sr, dur_s=0.8, freq=600.0)
+        resp = StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/wav")
+        resp.headers["X-TTS-Error"] = str(e)[:200]
+        return resp
+
+@app.get("/tts")
+def tts_get(text: Optional[str] = "", sr: Optional[int] = 16000):
+    t = (text or "").strip() or "系統測試音"
+    return tts(TTSIn(text=t, sr=sr))
+
 
 # ============= 開發啟動（直接 python main.py 時） =============
 if __name__ == "__main__":
