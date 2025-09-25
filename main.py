@@ -286,24 +286,81 @@ class OpenAITTSProvider(TTSProvider):
         self.voice  = OPENAI_TTS_VOICE
 
     def synth(self, text: str, sr: int = 16000) -> bytes:
-        # 多數 SDK 會提供 wav / pcm 選項；這裡以 "wav" 為例
+        """
+        兼容多版 OpenAI Python SDK：
+        依序嘗試幾種已存在過的參數寫法，拿到 bytes 就回傳。
+        一律要求 WAV（16-bit mono）與指定取樣率 sr。
+        """
+        # --- 嘗試 1：新版常見寫法：format= / sample_rate=
         try:
-            # 新版 SDK（可能支援 streaming），先試一次性取回全部 bytes
             r = self.client.audio.speech.create(
                 model=self.model,
                 voice=self.voice,
                 input=text,
-                format="wav",              # 要 WAV（含 44B header）
-                sample_rate=sr             # 由 ESP32 端自動跟隨
+                format="wav",             # 某些版本接受 format
+                sample_rate=sr,           # 某些版本接受 sample_rate
             )
-            # 有些 SDK 直接回 bytes；有些回物件需 .read()/.content
-            return getattr(r, "content", None) or getattr(r, "read", lambda: b"")()
+            data = getattr(r, "content", None)
+            if data: return data
+            reader = getattr(r, "read", None)
+            if callable(reader): return reader()
+        except TypeError:
+            pass
         except Exception:
-            # 相容舊 SDK（with_streaming_response）
+            pass
+
+        # --- 嘗試 2：有些版用 response_format=（而非 format=）
+        try:
+            r = self.client.audio.speech.create(
+                model=self.model,
+                voice=self.voice,
+                input=text,
+                response_format="wav",    # 用 response_format 指定格式
+                sample_rate=sr,
+            )
+            data = getattr(r, "content", None)
+            if data: return data
+            reader = getattr(r, "read", None)
+            if callable(reader): return reader()
+        except TypeError:
+            pass
+        except Exception:
+            pass
+
+        # --- 嘗試 3：有些版把音訊參數包在 audio={}
+        try:
+            r = self.client.audio.speech.create(
+                model=self.model,
+                voice=self.voice,
+                input=text,
+                audio={"format": "wav", "sample_rate": sr},  # audio 物件
+            )
+            data = getattr(r, "content", None)
+            if data: return data
+            reader = getattr(r, "read", None)
+            if callable(reader): return reader()
+        except TypeError:
+            pass
+        except Exception:
+            pass
+
+        # --- 嘗試 4：串流介面（with_streaming_response）
+        try:
             with self.client.audio.speech.with_streaming_response.create(
-                model=self.model, voice=self.voice, input=text, format="wav", sample_rate=sr
+                model=self.model,
+                voice=self.voice,
+                input=text,
+                # 同樣嘗試不同鍵名；串流介面通常接受 format
+                format="wav",
+                sample_rate=sr,
             ) as resp:
                 return resp.read()
+        except Exception:
+            pass
+
+        # 全部嘗試都失敗 → 交給上層（/tts 路由會回 beep 並在 header 帶錯誤）
+        raise RuntimeError("OpenAI TTS parameter compatibility failed (format/response_format/audio variants)")
+
 
 
 # B) Piper（本地，離線）
