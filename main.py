@@ -23,7 +23,7 @@ from fastapi.responses import StreamingResponse
 PROVIDER_STT  = os.getenv("PROVIDER_STT",  "local")     # local | openai
 PROVIDER_RAG  = os.getenv("PROVIDER_RAG",  "none")      # local | openai | none
 PROVIDER_LLM  = os.getenv("PROVIDER_LLM",  "openai")    # openai
-PROVIDER_STT  = os.getenv("PROVIDER_STT",  "openai")     # openai
+PROVIDER_TTS  = os.getenv("PROVIDER_TTS",  "openai")     # openai
 
 # Whisper（本地 STT）設定
 WHISPER_MODEL     = os.getenv("WHISPER_MODEL", "small") # tiny/base/small/medium/large-v3 ...
@@ -293,32 +293,20 @@ class OpenAITTSProvider(TTSProvider):
             "Content-Type": "application/json",
         }
 
-    def synth(self, text: str, sr: int = 16000) -> bytes:
-        """
-        一律向 OpenAI 請 WAV（RIFF）封裝的 16-bit PCM。
-        部分模型不吃 sample_rate；若不支援就讓服務端預設，ESP32 端會自動 i2s_set_clk 跟隨。
-        """
-        payload = {
-            "model": self.model,
-            "voice": self.voice,
-            "input": text,
-            # 關鍵！一定要明示 WAV，否則預設常是 MP3
-            "format": "wav",
-            # 有些版本支援 "sample_rate"；若報錯可拿掉這一行，交給預設 24k/22.05k
-            "sample_rate": int(sr),
-        }
+def synth(self, text: str, sr: int = 16000) -> bytes:
+    payload = {"model": self.model, "voice": self.voice, "input": text, "format": "wav", "sample_rate": int(sr)}
+    r = self.requests.post(self.base, headers=self.headers, json=payload, timeout=60)
+    if r.status_code == 400:
+        # 某些模型/版本不接受 sample_rate，移除後重試
+        payload.pop("sample_rate", None)
         r = self.requests.post(self.base, headers=self.headers, json=payload, timeout=60)
-        # 直接拿位元組（不要用 r.json()）
-        if r.status_code != 200:
-            raise RuntimeError(f"OpenAI TTS HTTP {r.status_code}: {r.text[:200]}")
-        audio_bytes = r.content
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI TTS HTTP {r.status_code}: {r.text[:200]}")
+    b = r.content
+    if not (len(b) >= 12 and b[:4] == b"RIFF" and b[8:12] == b"WAVE"):
+        raise RuntimeError("TTS returned non-WAV")
+    return b
 
-        # 保障：確認是 RIFF 頭，不是 MP3
-        if not (len(audio_bytes) >= 12 and audio_bytes[:4] == b"RIFF" and audio_bytes[8:12] == b"WAVE"):
-            # 回傳前面 16Bytes 方便你在 header 看
-            h = " ".join(f"{b:02X}" for b in audio_bytes[:16])
-            raise RuntimeError(f"TTS returned non-WAV (first16={h})")
-        return audio_bytes
 
 
 
