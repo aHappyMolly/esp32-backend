@@ -282,57 +282,43 @@ class OpenAITTSProvider(TTSProvider):
     def __init__(self):
         if not OPENAI_API_KEY:
             raise RuntimeError("OPENAI_API_KEY missing for OpenAI TTS")
-        import requests
-        self.http = requests
-        self.model  = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
-        self.voice  = os.getenv("OPENAI_TTS_VOICE", "alloy")
-        self.base   = OPENAI_BASE_URL.rstrip("/")
-
-    def _post_speech(self, payload: dict):
-        url = f"{self.base}/audio/speech"
-        headers = {
+        import requests  # 確保 requirements.txt 有 requests
+        self.requests = requests
+        self.model  = OPENAI_TTS_MODEL or "gpt-4o-mini-tts"
+        self.voice  = OPENAI_TTS_VOICE or "alloy"
+        self.base   = "https://api.openai.com/v1/audio/speech"
+        self.headers = {
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "Content-Type": "application/json",
         }
-        return self.http.post(url, headers=headers, json=payload, timeout=45)
 
     def synth(self, text: str, sr: int = 16000) -> bytes:
         """
-        走 REST API：
-        1) 先用你設定的 model（預設 gpt-4o-mini-tts）
-        2) 若失敗，依序嘗試其它常見可用模型：tts-1, gpt-4o-audio-preview
-        3) 針對參數鍵名再做兩輪：format / response_format
-        任一成功就回 bytes；否則丟出詳盡錯訊。
+        一律向 OpenAI 請 WAV（RIFF）封裝的 16-bit PCM。
+        部分模型不吃 sample_rate；若不支援就讓服務端預設，ESP32 端會自動 i2s_set_clk 跟隨。
         """
-        models_try = [self.model, "tts-1", "gpt-4o-audio-preview"]
-        errs = []
+        payload = {
+            "model": self.model,
+            "voice": self.voice,
+            "input": text,
+            # 關鍵！一定要明示 WAV，否則預設常是 MP3
+            "format": "wav",
+            # 有些版本支援 "sample_rate"；若報錯可拿掉這一行，交給預設 24k/22.05k
+            "sample_rate": int(sr),
+        }
+        r = self.requests.post(self.base, headers=self.headers, json=payload, timeout=60)
+        # 直接拿位元組（不要用 r.json()）
+        if r.status_code != 200:
+            raise RuntimeError(f"OpenAI TTS HTTP {r.status_code}: {r.text[:200]}")
+        audio_bytes = r.content
 
-        for m in models_try:
-            # 方案 A：format
-            r = self._post_speech({
-                "model": m,
-                "input": text,
-                "voice": self.voice,
-                "format": "wav",
-                "sample_rate": sr,
-            })
-            if r.status_code == 200 and r.headers.get("Content-Type","").startswith("audio/"):
-                return r.content
-            errs.append(f"[{m}/format] {r.status_code} {r.text[:180]}")
+        # 保障：確認是 RIFF 頭，不是 MP3
+        if not (len(audio_bytes) >= 12 and audio_bytes[:4] == b"RIFF" and audio_bytes[8:12] == b"WAVE"):
+            # 回傳前面 16Bytes 方便你在 header 看
+            h = " ".join(f"{b:02X}" for b in audio_bytes[:16])
+            raise RuntimeError(f"TTS returned non-WAV (first16={h})")
+        return audio_bytes
 
-            # 方案 B：response_format
-            r2 = self._post_speech({
-                "model": m,
-                "input": text,
-                "voice": self.voice,
-                "response_format": "wav",
-                "sample_rate": sr,
-            })
-            if r2.status_code == 200 and r2.headers.get("Content-Type","").startswith("audio/"):
-                return r2.content
-            errs.append(f"[{m}/response_format] {r2.status_code} {r2.text[:180]}")
-
-        raise RuntimeError(" | ".join(errs))
 
 
 
