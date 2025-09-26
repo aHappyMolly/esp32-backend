@@ -23,7 +23,7 @@ from fastapi.responses import StreamingResponse
 PROVIDER_STT  = os.getenv("PROVIDER_STT",  "local")     # local | openai
 PROVIDER_RAG  = os.getenv("PROVIDER_RAG",  "none")      # local | openai | none
 PROVIDER_LLM  = os.getenv("PROVIDER_LLM",  "openai")    # openai
-PROVIDER_TTS  = os.getenv("PROVIDER_TTS",  "openai")     # openai
+
 
 # Whisper（本地 STT）設定
 WHISPER_MODEL     = os.getenv("WHISPER_MODEL", "small") # tiny/base/small/medium/large-v3 ...
@@ -293,19 +293,19 @@ class OpenAITTSProvider(TTSProvider):
             "Content-Type": "application/json",
         }
 
-def synth(self, text: str, sr: int = 16000) -> bytes:
-    payload = {"model": self.model, "voice": self.voice, "input": text, "format": "wav", "sample_rate": int(sr)}
-    r = self.requests.post(self.base, headers=self.headers, json=payload, timeout=60)
-    if r.status_code == 400:
-        # 某些模型/版本不接受 sample_rate，移除後重試
-        payload.pop("sample_rate", None)
+    def synth(self, text: str, sr: int = 16000) -> bytes:
+        payload = {"model": self.model, "voice": self.voice, "input": text, "format": "wav", "sample_rate": int(sr)}
         r = self.requests.post(self.base, headers=self.headers, json=payload, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"OpenAI TTS HTTP {r.status_code}: {r.text[:200]}")
-    b = r.content
-    if not (len(b) >= 12 and b[:4] == b"RIFF" and b[8:12] == b"WAVE"):
-        raise RuntimeError("TTS returned non-WAV")
-    return b
+        if r.status_code == 400:
+            # 某些模型/版本不接受 sample_rate，移除後重試
+            payload.pop("sample_rate", None)
+            r = self.requests.post(self.base, headers=self.headers, json=payload, timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError(f"OpenAI TTS HTTP {r.status_code}: {r.text[:200]}")
+        b = r.content
+        if not (len(b) >= 12 and b[:4] == b"RIFF" and b[8:12] == b"WAVE"):
+            raise RuntimeError("TTS returned non-WAV")
+        return b
 
 
 
