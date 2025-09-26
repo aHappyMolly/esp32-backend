@@ -1,7 +1,7 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-pydantic==2.9.2
-requests==2.32.3
-openai==1.50.2
-# 若要本地 STT（PROVIDER_STT=local）：
-faster-whisper==1.0.3
+fastapi
+uvicorn[standard]
+pydantic
+requests
+openai
+
+faster-whisper
