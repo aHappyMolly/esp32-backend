@@ -6,5 +6,5 @@ openai==1.50.2
 # 若要本地 STT（PROVIDER_STT=local）：
 faster-whisper==1.0.3
 # 若要本地 TTS（PROVIDER_TTS=piper），且你確定要玩：
-piper-phonemize==1.2.0
+#piper-phonemize==1.2.0  #找不到這版本，先註解掉
 piper-tts==1.2.0
