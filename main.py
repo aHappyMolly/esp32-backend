@@ -23,6 +23,7 @@ from fastapi.responses import StreamingResponse
 PROVIDER_STT  = os.getenv("PROVIDER_STT",  "local")     # local | openai
 PROVIDER_RAG  = os.getenv("PROVIDER_RAG",  "none")      # local | openai | none
 PROVIDER_LLM  = os.getenv("PROVIDER_LLM",  "openai")    # openai
+PROVIDER_STT  = os.getenv("PROVIDER_STT",  "openai")     # openai
 
 # Whisper（本地 STT）設定
 WHISPER_MODEL     = os.getenv("WHISPER_MODEL", "small") # tiny/base/small/medium/large-v3 ...
