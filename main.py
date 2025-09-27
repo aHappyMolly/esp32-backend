@@ -14,6 +14,8 @@ from fastapi import FastAPI, UploadFile, File, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
+
 
 # ============= 環境參數（可在 PowerShell/cmd 或 .env 設定） =============
 # 供應商選項：
@@ -502,6 +504,47 @@ def tts(body: TTSIn):
 def tts_get(text: Optional[str] = "", sr: Optional[int] = 16000):
     t = (text or "").strip() or "系統測試音"
     return tts(TTSIn(text=t, sr=sr))
+
+
+@app.get("/tts_mp3")
+def tts_mp3(text: str = "", voice: str = "alloy"):
+    """回 MP3（audio/mpeg），給 ESP32-S3 + ESP8266Audio 直接串流播放。"""
+    t = (text or "").strip()
+    if not t:
+        raise HTTPException(400, "empty text")
+
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "OPENAI_API_KEY missing")
+
+    import requests
+    url = "https://api.openai.com/v1/audio/speech"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENAI_TTS_MODEL or "gpt-4o-mini-tts",
+        "voice": voice or (OPENAI_TTS_VOICE or "alloy"),
+        "input": t,
+        "format": "mp3",          # ★ 要 MP3
+        # MP3 自帶採樣率，通常不指定 sample_rate
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    if r.status_code != 200:
+        raise HTTPException(500, f"TTS failed: {r.status_code} {r.text[:200]}")
+
+    b = r.content
+    # 明確告知長度與關閉連線 → ESP32 串流更穩
+    return Response(
+        content=b,
+        media_type="audio/mpeg",
+        headers={
+            "Content-Length": str(len(b)),
+            "Cache-Control": "no-store",
+            "Connection": "close",
+        },
+    )
 
 
 # ============= 開發啟動（直接 python main.py 時） =============
