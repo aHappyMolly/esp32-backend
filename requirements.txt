@@ -6,4 +6,10 @@ openai
 
 python-multipart
 
+pytesseract
+pillow
+pdfplumber
+python-docx
+beautifulsoup4
+trafilatura
 

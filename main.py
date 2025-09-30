@@ -10,12 +10,16 @@ import json
 import math
 import tempfile
 from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, Request, HTTPException
+from fastapi import FastAPI, UploadFile, File, Request, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from fastapi.responses import Response
 from app.tools.router import run_tools  # ← 新增 import
+from pathlib import Path
+from app.rag.loaders import (
+    read_text_file, extract_pdf_text, extract_docx_text, extract_url_text
+)
 
 
 # ============= 環境參數（可在 PowerShell/cmd 或 .env 設定） =============
@@ -141,30 +145,41 @@ class OpenAIWhisperProvider(STTProvider):
 
 
 # ============= RAG Providers =============
+
 def _load_documents_from_dir(path: str) -> List[str]:
-    """讀取資料夾中的文字文件，做極簡清洗與切塊（按段或固定長度）。"""
-    exts = ("*.txt", "*.md", "*.mdx", "*.html")
-    files = []
-    for ext in exts:
-        files.extend(glob.glob(os.path.join(path, ext)))
-    chunks = []
-    for fp in files:
-        try:
-            txt = open(fp, "r", encoding="utf-8", errors="ignore").read()
-        except:
+    """讀取 knowledge 中的各類文件 → 純文字 → 簡單切塊"""
+    chunks: List[str] = []
+    exts = [".txt", ".md", ".mdx", ".html", ".htm", ".pdf", ".docx"]
+    for p in Path(path).rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in exts:
             continue
-        # 粗略切塊：先按段落拆，再限制每塊長度
-        for para in txt.splitlines():
-            t = para.strip()
+
+        text = None
+        suf = p.suffix.lower()
+        if suf in [".txt", ".md", ".mdx", ".html", ".htm"]:
+            text = read_text_file(p)
+        elif suf == ".pdf":
+            text = extract_pdf_text(p)
+        elif suf == ".docx":
+            text = extract_docx_text(p)
+
+        if not (text and text.strip()):
+            continue
+
+        # --- 你的原本切塊策略（每塊 ≤800 字） ---
+        for para in text.splitlines():
+            t = (para or "").strip()
             if not t:
                 continue
-            # 最多 600-800 字一塊
             while len(t) > 800:
                 chunks.append(t[:800])
                 t = t[800:]
             if t:
                 chunks.append(t)
     return chunks
+
+    # --- 若未來要 OCR 掃描版 PDF：在 extract_pdf_text 中偵測 page.images，必要時切圖丟 pytesseract
+
 
 # A) local RAG（免外部依賴的極簡檢索：tf-idf-like + overlap 分數）
 class LocalNaiveRAG(RAGProvider):
@@ -406,6 +421,19 @@ def load_providers():
         tts_provider = PiperTTSProvider()
     else:
         raise RuntimeError(f"Unknown PROVIDER_TTS: {PROVIDER_TTS}")
+    
+    
+# 重建索引 ( 讓相關 API 可以呼叫它重整 RAG)
+def _reload_rag_provider():
+    """重新載入 RAG（依照目前 PROVIDER_RAG），以便上傳/新增網址後立即生效。"""
+    global rag_provider
+    if PROVIDER_RAG == "local":
+        rag_provider = LocalNaiveRAG(KNOWLEDGE_DIR)
+    elif PROVIDER_RAG == "openai":
+        rag_provider = OpenAIRAG(KNOWLEDGE_DIR)
+    elif PROVIDER_RAG == "none":
+        rag_provider = RAGProvider()
+
 
 
 # ============= 路由 =============
@@ -552,6 +580,45 @@ def tts_mp3(text: str = "", voice: str = "alloy"):
             "Connection": "close",
         },
     )
+
+
+# 方便把資料丟進 RAG ( 上傳檔案 → 存進 knowledge → 重新索引 )
+@app.post("/rag/upload")
+async def rag_upload(file: UploadFile = File(...)):
+    """支援 .txt .md .html .pdf .docx，上傳後存進 knowledge/ 原檔名，並重建索引。"""
+    suf = Path(file.filename).suffix.lower()
+    if suf not in [".txt", ".md", ".mdx", ".html", ".htm", ".pdf", ".docx"]:
+        raise HTTPException(400, "Unsupported file type")
+
+    # 保存到 knowledge/
+    dst = Path(KNOWLEDGE_DIR) / Path(file.filename).name
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    data = await file.read()
+    dst.write_bytes(data)
+
+    # 重建索引
+    _reload_rag_provider()
+
+    return {"ok": True, "saved": str(dst.name), "chunks": len(getattr(rag_provider, "chunks", []))}
+
+
+# 方便把資料丟進 RAG (加入網址 → 轉文字 → 存成 .txt → 重新索引)
+@app.post("/rag/add_url")
+async def rag_add_url(url: str = Form(...)):
+    """把網址主要內文抓下來，存成 .txt 到 knowledge，並重建索引。"""
+    text = extract_url_text(url)
+    if not text:
+        raise HTTPException(400, "Failed to extract text from URL")
+
+    safe = "".join(ch for ch in url if ch.isalnum() or ch in "-_").strip("-_")[:60]
+    if not safe:
+        safe = "page"
+    dst = Path(KNOWLEDGE_DIR) / f"{safe}.txt"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(text, encoding="utf-8")
+
+    _reload_rag_provider()
+    return {"ok": True, "saved": dst.name, "chars": len(text), "chunks": len(getattr(rag_provider, "chunks", []))}
 
 
 # ============= 開發啟動（直接 python main.py 時） =============
