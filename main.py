@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from fastapi.responses import Response
+from app.tools.router import run_tools  # ← 新增 import
 
 
 # ============= 環境參數（可在 PowerShell/cmd 或 .env 設定） =============
@@ -449,17 +450,23 @@ async def stt(file: Optional[UploadFile] = File(None), request: Request = None):
     except Exception as e:
         raise HTTPException(500, f"STT error: {e}")
 
+
 class ChatIn(BaseModel):
     text: str
+    device_context: Optional[dict] = None   # ← 允許前端附座標/時區
 
 @app.post("/chat")
 def chat(body: ChatIn):
     if llm_provider is None or rag_provider is None:
         raise HTTPException(500, "Providers not loaded")
     try:
-        chunks = rag_provider.retrieve(body.text, k=RAG_TOP_K) if hasattr(rag_provider, "retrieve") else []
+        tool_chunks, tool_sources = run_tools(body.text, body.device_context)  # ← 新增
+        rag_chunks = rag_provider.retrieve(body.text, k=RAG_TOP_K) if hasattr(rag_provider, "retrieve") else []
+        chunks = tool_chunks + rag_chunks
+
         reply  = llm_provider.chat(body.text, chunks, lang=REPLY_LANG)
-        return {"ok": True, "reply": reply, "ctx_used": len(chunks)}
+        # 新增 sources：工具 + （可選）RAG 檔名/片段（之後升級 chunking 回報檔名）
+        return {"ok": True, "reply": reply, "ctx_used": len(chunks), "sources": tool_sources}
     except Exception as e:
         raise HTTPException(500, f"Chat error: {e}")
     
