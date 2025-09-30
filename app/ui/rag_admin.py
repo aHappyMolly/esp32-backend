@@ -46,6 +46,9 @@ const el = id => document.getElementById(id);
 function fmtBytes(n){ if(n<1024) return n+' B'; if(n<1048576) return (n/1024).toFixed(1)+' KB'; if(n<1073741824) return (n/1048576).toFixed(1)+' MB'; return (n/1073741824).toFixed(1)+' GB'; }
 function fmtTime(s){ const d=new Date(s*1000); return d.toLocaleString(); }
 
+// 若沒設定，給預設值（改成你的後端 Base URL）
+window.API_BASE = window.API_BASE || "https://esp32-backend-o4fc.onrender.com";
+
 async function upload(){
   const f = el('file').files[0];
   if(!f){ alert('請先選擇檔案'); return; }
@@ -108,4 +111,4 @@ load();
 def mount_rag_admin(app):
     @app.get("/rag", response_class=HTMLResponse)
     def rag_admin_page():
-        return HTMLResponse(content=RAG_ADMIN_HTML, status_code=200)
+        return HTMLResponse(content=_RAG_ADMIN_HTML, status_code=200)
