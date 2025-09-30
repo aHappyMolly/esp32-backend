@@ -9,17 +9,20 @@ import glob
 import json
 import math
 import tempfile
+import datetime
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Request, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from fastapi.responses import StreamingResponse
-from fastapi.responses import Response
+from fastapi.responses import StreamingResponse, Response, HTMLResponse, JSONResponse
 from app.tools.router import run_tools  # ← 新增 import
 from pathlib import Path
 from app.rag.loaders import (
     read_text_file, extract_pdf_text, extract_docx_text, extract_url_text
 )
+from app.ui.rag_admin import mount_rag_admin
+
+
 
 
 # ============= 環境參數（可在 PowerShell/cmd 或 .env 設定） =============
@@ -66,6 +69,9 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"]
 )
+
+# 只是註冊一個 /rag 的 GET 路由 ( app 已存在 → rag_admin)
+mount_rag_admin(app)
 
 
 # ============= Provider 介面定義 =============
@@ -422,7 +428,7 @@ def load_providers():
     else:
         raise RuntimeError(f"Unknown PROVIDER_TTS: {PROVIDER_TTS}")
     
-    
+
 # 重建索引 ( 讓相關 API 可以呼叫它重整 RAG)
 def _reload_rag_provider():
     """重新載入 RAG（依照目前 PROVIDER_RAG），以便上傳/新增網址後立即生效。"""
@@ -619,6 +625,28 @@ async def rag_add_url(url: str = Form(...)):
 
     _reload_rag_provider()
     return {"ok": True, "saved": dst.name, "chars": len(text), "chunks": len(getattr(rag_provider, "chunks", []))}
+
+
+@app.get("/rag/list")
+def rag_list():
+    return {"ok": True, "files": _list_knowledge_files()}
+
+@app.post("/rag/delete")
+def rag_delete(name: str = Form(...)):
+    """刪除 knowledge 內指定檔案，並重建索引。"""
+    root = Path(KNOWLEDGE_DIR).resolve()
+    target = (root / name).resolve()
+    if not str(target).startswith(str(root)) or not target.exists() or not target.is_file():
+        raise HTTPException(400, "file not found")
+    target.unlink()
+    _reload_rag_provider()
+    return {"ok": True, "deleted": name, "chunks": len(getattr(rag_provider, "chunks", []))}
+
+@app.post("/rag/reindex")
+def rag_reindex():
+    """手動重建索引。"""
+    _reload_rag_provider()
+    return {"ok": True, "chunks": len(getattr(rag_provider, "chunks", []))}
 
 
 # ============= 開發啟動（直接 python main.py 時） =============
