@@ -13,6 +13,7 @@ import datetime
 import json, re, requests
 import zipfile, time
 from typing import List, Optional
+from bs4 import BeautifulSoup
 from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, Request, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,7 +24,7 @@ from app.rag.loaders import (
     read_text_file, extract_pdf_text, extract_docx_text, extract_url_text
 )
 from app.ui.rag_admin import mount_rag_admin
-from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 
 
@@ -188,6 +189,61 @@ def _load_documents_from_dir(path: str) -> List[str]:
     return chunks
 
     # --- 若未來要 OCR 掃描版 PDF：在 extract_pdf_text 中偵測 page.images，必要時切圖丟 pytesseract
+
+
+# --- 圖片建議：從工具來源 URL 抓 og:image + 從 knowledge/.meta.json 挑關鍵圖 ---
+# 即使目前的 RAG chunk 沒帶「來源檔名」，也可先用「工具來源 URL」與「knowledge 的 .meta.json」來挑圖
+def _images_from_tool_sources(sources, max_n=3):
+    imgs = []
+    for s in sources or []:
+        url = (s.get("url") if isinstance(s, dict) else None) or ""
+        if not url or not url.startswith("http"): 
+            continue
+        try:
+            r = requests.get(url, timeout=6, headers={"User-Agent":"Mozilla/5.0"})
+            html = r.text
+            # og:image
+            m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+            if m:
+                img = m.group(1).strip()
+                if not img.startswith("http"):
+                    img = urljoin(url, img)
+                imgs.append(img)
+        except Exception:
+            pass
+        if len(imgs) >= max_n:
+            break
+    return imgs
+
+def _images_from_meta_by_query(query: str, max_n=3):
+    """掃描 knowledge/*.meta.json，若 title/url/tags 命中 query，就收集 image/images。"""
+    out = []
+    q = (query or "").lower()
+    root = Path(KNOWLEDGE_DIR)
+    for m in root.glob("*.meta.json"):
+        try:
+            meta = json.loads(m.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        text_for_match = " ".join([
+            str(meta.get("title","")), str(meta.get("url","")),
+            " ".join(meta.get("tags",[]))
+        ]).lower()
+        if any(tok and tok in text_for_match for tok in [q]):
+            # 支援單一 image 或 images陣列
+            if meta.get("image"):
+                out.append(meta["image"])
+            if isinstance(meta.get("images"), list):
+                out.extend([x for x in meta["images"] if isinstance(x, str)])
+        if len(out) >= max_n:
+            break
+    # 去重
+    seen=set(); uniq=[]
+    for u in out:
+        if u not in seen:
+            seen.add(u); uniq.append(u)
+    return uniq[:max_n]
+
 
 
 # A) local RAG（免外部依賴的極簡檢索：tf-idf-like + overlap 分數）
@@ -523,8 +579,13 @@ def chat(body: ChatIn):
         chunks = tool_chunks + rag_chunks
 
         reply  = llm_provider.chat(body.text, chunks, lang=REPLY_LANG)
-        # 新增 sources：工具 + （可選）RAG 檔名/片段（之後升級 chunking 回報檔名）
-        return {"ok": True, "reply": reply, "ctx_used": len(chunks), "sources": tool_sources}
+
+        images_a = _images_from_tool_sources(tool_sources, max_n=3)
+        images_b = _images_from_meta_by_query(body.text, max_n=3)
+        images = (images_a + images_b)[:3]
+
+        return {"ok": True, "reply": reply, "ctx_used": len(chunks), "sources": tool_sources, "images": images}
+
     except Exception as e:
         raise HTTPException(500, f"Chat error: {e}")
     
@@ -646,6 +707,24 @@ async def rag_add_url(url: str = Form(...)):
     dst = Path(KNOWLEDGE_DIR) / f"{safe}.txt"
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(text, encoding="utf-8")
+
+    # 擷取 title 與 og:image，寫同名 meta 檔
+    title = ""; og_image = ""
+    try:
+        r = requests.get(url, timeout=6, headers={"User-Agent":"Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "html.parser")
+        title = (soup.title.string or "").strip() if soup.title else ""
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"): og_image = og.get("content").strip()
+    except Exception:
+        pass
+
+    meta = {"url": url, "title": title}
+    if og_image: meta["image"] = og_image
+    (Path(KNOWLEDGE_DIR) / f"{safe}.txt.meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
 
     _reload_rag_provider()
     return {"ok": True, "saved": dst.name, "chars": len(text), "chunks": len(getattr(rag_provider, "chunks", []))}
