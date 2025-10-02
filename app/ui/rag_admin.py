@@ -18,7 +18,7 @@ _RAG_ADMIN_HTML = r"""<!doctype html>
 </style>
 <div class="card">
   <h2>RAG 管理</h2>
-  <a class="btn" href="http://esp32s3.local/">← 回首頁</a>
+  <p><a href="http://esp32s3.local/">← 回首頁</a></p>
   <p class="muted">※ 上傳與貼網址只會寫入後端檔案系統，<b>記得完成後自行 push 到 GitHub / 重新部署 Render</b>。</p>
 
   <h3>上傳檔案（.txt .md .html .pdf .docx）</h3>
@@ -39,8 +39,11 @@ _RAG_ADMIN_HTML = r"""<!doctype html>
     <span id="status" class="muted"></span>
   </div>
 
-  <h3 style="margin-top:18px">目前檔案</h3>
-  <div id="tableWrap"></div>
+  <div style="border-top:1px solid ; margin-top:20px; padding-top:16px">
+    <h3 style="margin-top:18px">目前檔案</h3>
+    <div id="tableWrap"></div>
+  </div>
+
 </div>
 
 <script>
