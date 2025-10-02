@@ -1,15 +1,4 @@
 {
-  "title": "A 展品（正式名稱）",
-  "url": "https://museum.example.com/a",
-  "image": "https://museum.example.com/a/main.jpg",
-  "images": [
-    "https://museum.example.com/a/main.jpg",
-    "https://museum.example.com/a/detail1.jpg"
-  ],
-  "tags": ["展覽", "A展品", "典藏"]
-}
-
-{
   "title": "鳥屎",
   "url": "https://zh.wikipedia.org/zh-tw/%E8%98%87%E5%BF%97%E7%BF%94",
   "image": "https://zh.wikipedia.org/zh-tw/%E8%98%87%E5%BF%97%E7%BF%94#/media/File:Niaws_Su_talking_at_Wild_Stage_20221105a.jpg",
