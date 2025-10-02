@@ -10,6 +10,7 @@ import json
 import math
 import tempfile
 import datetime
+import json, re, requests
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Request, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +22,7 @@ from app.rag.loaders import (
     read_text_file, extract_pdf_text, extract_docx_text, extract_url_text
 )
 from app.ui.rag_admin import mount_rag_admin
+from bs4 import BeautifulSoup
 
 
 
@@ -386,6 +388,38 @@ def make_beep_wav(sr: int = 16000, dur_s: float = 0.8, freq: float = 1000.0) -> 
 
 
 
+# =============== RAG 上傳相關 ================
+
+# 重建索引 ( 讓相關 API 可以呼叫它重整 RAG)
+def _reload_rag_provider():
+    """重新載入 RAG（依照目前 PROVIDER_RAG），以便上傳/新增網址後立即生效。"""
+    global rag_provider
+    if PROVIDER_RAG == "local":
+        rag_provider = LocalNaiveRAG(KNOWLEDGE_DIR)
+    elif PROVIDER_RAG == "openai":
+        rag_provider = OpenAIRAG(KNOWLEDGE_DIR)
+    elif PROVIDER_RAG == "none":
+        rag_provider = RAGProvider()
+
+
+# 列出 knowledge 目錄檔案（給 /rag/list 用）
+def _list_knowledge_files():
+    root = Path(KNOWLEDGE_DIR)
+    root.mkdir(parents=True, exist_ok=True)
+    items = []
+    for p in sorted(root.glob("*")):
+        if p.is_file():
+            st = p.stat()
+            items.append({
+                "name": p.name,
+                "size": st.st_size,
+                "mtime": int(st.st_mtime),
+                "ext": p.suffix.lower(),
+            })
+    return items
+
+
+
 # ============= Provider 載入器 =============
 stt_provider: Optional[STTProvider] = None
 rag_provider: Optional[RAGProvider] = None
@@ -428,17 +462,6 @@ def load_providers():
     else:
         raise RuntimeError(f"Unknown PROVIDER_TTS: {PROVIDER_TTS}")
     
-
-# 重建索引 ( 讓相關 API 可以呼叫它重整 RAG)
-def _reload_rag_provider():
-    """重新載入 RAG（依照目前 PROVIDER_RAG），以便上傳/新增網址後立即生效。"""
-    global rag_provider
-    if PROVIDER_RAG == "local":
-        rag_provider = LocalNaiveRAG(KNOWLEDGE_DIR)
-    elif PROVIDER_RAG == "openai":
-        rag_provider = OpenAIRAG(KNOWLEDGE_DIR)
-    elif PROVIDER_RAG == "none":
-        rag_provider = RAGProvider()
 
 
 
@@ -623,8 +646,27 @@ async def rag_add_url(url: str = Form(...)):
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(text, encoding="utf-8")
 
+    # 抓 title 與 og:image（失敗就留空）
+    title = ""; og_image = ""
+    try:
+        r = requests.get(url, timeout=6, headers={"User-Agent":"Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "html.parser")
+        title = (soup.title.string or "").strip() if soup.title else ""
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"): og_image = og.get("content").strip()
+    except Exception:
+        pass
+
+    # 寫 meta.json
+    meta = {"url": url, "title": title, "og_image": og_image}
+    (Path(KNOWLEDGE_DIR) / f"{safe}.txt.meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
     _reload_rag_provider()
     return {"ok": True, "saved": dst.name, "chars": len(text), "chunks": len(getattr(rag_provider, "chunks", []))}
+
 
 
 @app.get("/rag/list")
