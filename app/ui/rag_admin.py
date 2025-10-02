@@ -18,6 +18,7 @@ _RAG_ADMIN_HTML = r"""<!doctype html>
 </style>
 <div class="card">
   <h2>RAG 管理</h2>
+  <a class="btn" href="http://esp32s3.local/">← 回首頁</a>
   <p class="muted">※ 上傳與貼網址只會寫入後端檔案系統，<b>記得完成後自行 push 到 GitHub / 重新部署 Render</b>。</p>
 
   <h3>上傳檔案（.txt .md .html .pdf .docx）</h3>
@@ -34,6 +35,7 @@ _RAG_ADMIN_HTML = r"""<!doctype html>
 
   <div class="row" style="margin-top:8px">
     <button class="btn" onclick="reindex()">重建索引</button>
+    <button class="btn" onclick="backup()">下載備份</button>
     <span id="status" class="muted"></span>
   </div>
 
@@ -74,6 +76,9 @@ async function reindex(){
   const r = await fetch('/rag/reindex', {method:'POST'});
   const j = await r.json();
   el('status').textContent = j.ok ? ('✅ 重新索引完成，chunks='+j.chunks) : ('❌ '+(j.detail||JSON.stringify(j)));
+}
+async function backup(){
+  window.open('/rag/backup', '_blank');  // 直接打開新分頁觸發下載
 }
 async function del(name){
   if(!confirm('確定刪除 '+name+' ?')) return;

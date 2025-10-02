@@ -11,10 +11,11 @@ import math
 import tempfile
 import datetime
 import json, re, requests
+import zipfile, time
 from typing import List, Optional
+from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, Request, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from fastapi.responses import StreamingResponse, Response, HTMLResponse, JSONResponse
 from app.tools.router import run_tools  # ← 新增 import
 from pathlib import Path
@@ -611,6 +612,7 @@ def tts_mp3(text: str = "", voice: str = "alloy"):
     )
 
 
+
 # 方便把資料丟進 RAG ( 上傳檔案 → 存進 knowledge → 重新索引 )
 @app.post("/rag/upload")
 async def rag_upload(file: UploadFile = File(...)):
@@ -670,6 +672,21 @@ def rag_reindex():
     """手動重建索引。"""
     _reload_rag_provider()
     return {"ok": True, "chunks": len(getattr(rag_provider, "chunks", []))}
+
+
+# RAG 從管理頁上傳後，再打包下載，把線上內容拉回本機備份 
+@app.get("/rag/backup")
+def rag_backup():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        root = Path(KNOWLEDGE_DIR)
+        for p in root.glob("*"):
+            if p.is_file():
+                z.write(p, arcname=p.name)
+    buf.seek(0)
+    fname = f"knowledge_backup_{int(time.time())}.zip"
+    return StreamingResponse(buf, media_type="application/zip",
+                             headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
 # ============= 開發啟動（直接 python main.py 時） =============
