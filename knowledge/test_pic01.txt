@@ -1,0 +1,24 @@
+---
+title: A 展品（正式名稱）
+url: https://museum.example.com/a
+image: https://museum.example.com/a/main.jpg
+images:
+  - https://museum.example.com/a/main.jpg
+  - https://museum.example.com/a/detail1.jpg
+tags: [展覽, A展品, 典藏]
+---
+<後面才是介紹內文……>
+
+
+
+---
+title: 斯里蘭卡狗狗
+url: https://www.instagram.com/p/C3GAyqxvITp/?img_index=9
+image: https://www.instagram.com/p/C3GAyqxvITp/?img_index=1
+images:
+  - https://www.instagram.com/p/C3GAyqxvITp/?img_index=4
+  - https://www.instagram.com/p/C3GAyqxvITp/?img_index=5
+tags: [Instagram, 狗勾, 2024年, 出國]
+---
+<後面才是介紹內文……>
+
