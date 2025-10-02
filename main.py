@@ -636,33 +636,14 @@ async def rag_upload(file: UploadFile = File(...)):
 async def rag_add_url(url: str = Form(...)):
     """把網址主要內文抓下來，存成 .txt 到 knowledge，並重建索引。"""
     text = extract_url_text(url)
-    if not text:
-        raise HTTPException(400, "Failed to extract text from URL")
-
-    safe = "".join(ch for ch in url if ch.isalnum() or ch in "-_").strip("-_")[:60]
-    if not safe:
-        safe = "page"
+    if not text or not text.strip():
+        # 加強除錯：在伺服器日誌印一次，前端看到 400 但你可在後端查看是哪個 URL 抓不到
+        print(f"[rag_add_url] extract failed: {url}")
+        raise HTTPException(400, "Failed to extract text from URL (no text)")
+    safe = "".join(ch for ch in url if ch.isalnum() or ch in "-_").strip("-_")[:60] or "page"
     dst = Path(KNOWLEDGE_DIR) / f"{safe}.txt"
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(text, encoding="utf-8")
-
-    # 抓 title 與 og:image（失敗就留空）
-    title = ""; og_image = ""
-    try:
-        r = requests.get(url, timeout=6, headers={"User-Agent":"Mozilla/5.0"})
-        soup = BeautifulSoup(r.text, "html.parser")
-        title = (soup.title.string or "").strip() if soup.title else ""
-        og = soup.find("meta", property="og:image")
-        if og and og.get("content"): og_image = og.get("content").strip()
-    except Exception:
-        pass
-
-    # 寫 meta.json
-    meta = {"url": url, "title": title, "og_image": og_image}
-    (Path(KNOWLEDGE_DIR) / f"{safe}.txt.meta.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
 
     _reload_rag_provider()
     return {"ok": True, "saved": dst.name, "chars": len(text), "chunks": len(getattr(rag_provider, "chunks", []))}
