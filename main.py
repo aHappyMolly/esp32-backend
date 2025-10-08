@@ -215,34 +215,60 @@ def _images_from_tool_sources(sources, max_n=3):
             break
     return imgs
 
+# 取代 main.py 內的 _images_from_meta_by_query
 def _images_from_meta_by_query(query: str, max_n=3):
-    """掃描 knowledge/*.meta.json，若 title/url/tags 命中 query，就收集 image/images。"""
+    """掃描 knowledge/*.meta.json，若 title/url/tags 有任何 token 命中，就收集 image/images。"""
+    def _tokens(s: str):
+        s = (s or "").lower().strip()
+        out, buf = [], []
+        for ch in s:
+            # 中文：逐字；英文數字：聚成詞
+            if "\u4e00" <= ch <= "\u9fff":
+                if buf: out.append("".join(buf)); buf=[]
+                out.append(ch)
+            elif ch.isalnum():
+                buf.append(ch)
+            else:
+                if buf: out.append("".join(buf)); buf=[]
+        if buf: out.append("".join(buf))
+        # 過濾太短的英文 token
+        return [t for t in out if (len(t)>=2 or ("\u4e00"<=t<= "\u9fff"))]
+
+    q_tokens = _tokens(query)
+    if not q_tokens:
+        return []
+
     out = []
-    q = (query or "").lower()
     root = Path(KNOWLEDGE_DIR)
     for m in root.glob("*.meta.json"):
         try:
             meta = json.loads(m.read_text(encoding="utf-8"))
         except Exception:
             continue
-        text_for_match = " ".join([
-            str(meta.get("title","")), str(meta.get("url","")),
-            " ".join(meta.get("tags",[]))
+
+        hay = " ".join([
+            str(meta.get("title","")),
+            str(meta.get("url","")),
+            " ".join(meta.get("tags",[])),
         ]).lower()
-        if any(tok and tok in text_for_match for tok in [q]):
-            # 支援單一 image 或 images陣列
+
+        # 只要任一 token 出現在 title/url/tags 就視為命中
+        if any(tok in hay for tok in q_tokens):
             if meta.get("image"):
                 out.append(meta["image"])
             if isinstance(meta.get("images"), list):
                 out.extend([x for x in meta["images"] if isinstance(x, str)])
+
         if len(out) >= max_n:
             break
-    # 去重
-    seen=set(); uniq=[]
+
+    # 去重、限量
+    seen, uniq = set(), []
     for u in out:
         if u not in seen:
             seen.add(u); uniq.append(u)
     return uniq[:max_n]
+
 
 
 
