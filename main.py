@@ -135,7 +135,7 @@ class OpenAIWhisperProvider(STTProvider):
             raise RuntimeError("OPENAI_API_KEY missing for OpenAI STT")
         from openai import OpenAI
         self.client = OpenAI()
-        print("STT is opening")
+
 
     def transcribe(self, audio_bytes: bytes) -> str:
         from tempfile import NamedTemporaryFile
@@ -152,7 +152,6 @@ class OpenAIWhisperProvider(STTProvider):
             response_format="json"
         )
         # r.text 將是文字
-        print("voice to text")#10/31
         return r.text.strip()
 
 
