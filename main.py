@@ -452,6 +452,21 @@ class PiperTTSProvider(TTSProvider):
             wf.setframerate(sr)
             wf.writeframes(pcm16.tobytes())
         return buf.getvalue()
+    
+
+
+# === 小工具：把 16-bit mono PCM 轉成 WAV bytes ===
+def pcm16le_to_wav(pcm_bytes: bytes, sr: int = 16000) -> bytes:
+    import io, wave, array
+    # 這裡假設 pcm_bytes 已是 16-bit little-endian mono
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
 
 
 # ============= 加入一個產生 beep WAV 的小工具 =============
@@ -889,29 +904,28 @@ def stt_begin():
 
 @app.post("/stt/seg")
 async def stt_seg(request: Request, sid: str):
-    """
-    連續上傳音訊分片（原樣 PCM/WAV 皆可；建議小包 16000Hz * 0.2 秒 = 3200 取樣 -> 6400 bytes）
-    這裡做「粗粒度增量轉寫」：每累積 ~0.8 秒就跑一次 STT，並把 partial 傳到 SSE。
-    """
     s = _stt_get(sid)
     if not s: 
         return JSONResponse({"ok": False, "err": "bad sid"}, status_code=400)
+
     chunk = await request.body()
+    if not chunk:
+        return {"ok": True, "bytes": 0}
+
+    # 這裡收到的是「原始 PCM 16-bit mono @16kHz」
     s["buf"].extend(chunk)
 
-    # ---- 閾值到就跑一次「增量辨識」並推送 partial ----
-    # 為了簡單穩定，這裡每 0.8 秒做一次整段重跑（模型快取不做）。
-    # 你用 GPU 的 faster-whisper small/medium 時通常也夠快；要更即時可換成真正 streaming API。
-    MIN_BYTES_PER_PUSH = 16000 * 2 * 8 // 10  # 0.8s @16kHz 16-bit mono ≈ 25600 bytes
-    if len(s["buf"]) >= MIN_BYTES_PER_PUSH and isinstance(stt_provider, LocalWhisperProvider):
+    # ---- 閾值到就做一次「粗粒度」字幕（用累積到目前為止的 PCM，臨時包成 WAV 再丟 STT）----
+    MIN_BYTES_PER_PUSH = 16000 * 2 * 8 // 10  # ~0.8s
+    if len(s["buf"]) >= MIN_BYTES_PER_PUSH:
         try:
-            # 寫暫存檔給 faster-whisper
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(s["buf"])
-                path = tmp.name
-            # 跑一次辨識（帶 vad，避免太多空白）
-            txt = LocalWhisperProvider().transcribe(Path(path).read_bytes())
-            # 推 SSE（partial）
+            wav_bytes = pcm16le_to_wav(bytes(s["buf"]), sr=16000)
+            # 用你目前載入的 provider 決定跑誰（local/openai 都支援）
+            if isinstance(stt_provider, STTProvider):
+                txt = stt_provider.transcribe(wav_bytes)
+            else:
+                txt = ""
+            # 推送 partial 到 SSE
             try:
                 await s["sse_queue"].put(json.dumps({"partial": txt}))
             except Exception:
@@ -920,6 +934,41 @@ async def stt_seg(request: Request, sid: str):
             print("[stt_seg]", e)
 
     return {"ok": True, "bytes": len(chunk)}
+
+
+@app.post("/stt/end")
+async def stt_end(sid: str):
+    s = _stt_get(sid)
+    if not s:
+        return JSONResponse({"ok": False, "err": "bad sid"}, status_code=400)
+
+    # 最終：把整段 PCM 包成 WAV 再丟 STT
+    try:
+        wav_bytes = pcm16le_to_wav(bytes(s["buf"]), sr=16000)
+        if isinstance(stt_provider, STTProvider):
+            text = stt_provider.transcribe(wav_bytes)
+        else:
+            text = ""
+    except Exception as e:
+        text = ""
+
+    # 推 final 到 SSE
+    try:
+        await s["sse_queue"].put(json.dumps({"final": text}))
+    except Exception:
+        pass
+    _stt_close(sid)
+
+    # 結合 LLM（保持你原本的一步到位設計）
+    reply = ""
+    try:
+        ctx = rag_provider.retrieve(text, k=RAG_TOP_K) if hasattr(rag_provider, "retrieve") else []
+        reply = llm_provider.chat(text, ctx, lang=REPLY_LANG)
+    except Exception as e:
+        print("[stt_end LLM]", e)
+
+    return {"ok": True, "text": text, "reply": reply}
+
 
 @app.get("/stt/sse")
 async def stt_sse(sid: str):
@@ -945,43 +994,5 @@ async def stt_sse(sid: str):
 
     return StreamingResponse(eventgen(), media_type="text/event-stream")
 
-@app.post("/stt/end")
-async def stt_end(sid: str):
-    """
-    關閉會話，做一次最終辨識，推送 final 結果，回傳文字。
-    """
-    s = _stt_get(sid)
-    if not s:
-        return JSONResponse({"ok": False, "err": "bad sid"}, status_code=400)
 
-    # 最終一次完整辨識（可較精確）
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(s["buf"])
-            path = tmp.name
-        if isinstance(stt_provider, LocalWhisperProvider):
-            text = LocalWhisperProvider().transcribe(Path(path).read_bytes())
-        else:
-            # 若你用 OpenAI STT：直接丟整段
-            text = OpenAIWhisperProvider().transcribe(Path(path).read_bytes())
-    except Exception as e:
-        text = ""
-
-    # 推 final 到 SSE
-    try:
-        await s["sse_queue"].put(json.dumps({"final": text}))
-    except Exception:
-        pass
-    _stt_close(sid)
-
-    # 📌 這裡直接幫你接到 LLM（/chat）→ 省一次往返
-    reply = ""
-    try:
-        ctx = rag_provider.retrieve(text, k=RAG_TOP_K) if hasattr(rag_provider, "retrieve") else []
-        reply = llm_provider.chat(text, ctx, lang=REPLY_LANG)
-        # 你原本的 TTS 流程維持不變，由前端/ESP32 自行呼叫 /i2s/say
-    except Exception as e:
-        print("[stt_end LLM]", e)
-
-    return {"ok": True, "text": text, "reply": reply}
 
