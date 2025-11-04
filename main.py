@@ -136,7 +136,6 @@ class OpenAIWhisperProvider(STTProvider):
         from openai import OpenAI
         self.client = OpenAI()
 
-
     def transcribe(self, audio_bytes: bytes) -> str:
         from tempfile import NamedTemporaryFile
         # OpenAI SDK 需要 file-like；這裡也走暫存檔
@@ -452,21 +451,6 @@ class PiperTTSProvider(TTSProvider):
             wf.setframerate(sr)
             wf.writeframes(pcm16.tobytes())
         return buf.getvalue()
-    
-
-
-# === 小工具：把 16-bit mono PCM 轉成 WAV bytes ===
-def pcm16le_to_wav(pcm_bytes: bytes, sr: int = 16000) -> bytes:
-    import io, wave, array
-    # 這裡假設 pcm_bytes 已是 16-bit little-endian mono
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
-        wf.writeframes(pcm_bytes)
-    return buf.getvalue()
-
 
 
 # ============= 加入一個產生 beep WAV 的小工具 =============
@@ -857,142 +841,3 @@ def rag_backup():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
-
-
-
-# ==== ✨ Low-latency STT Streaming (Segmented over HTTP) ====
-from fastapi import WebSocket, WebSocketDisconnect
-from fastapi import Depends
-from fastapi.responses import StreamingResponse
-from collections import defaultdict
-import uuid
-import asyncio
-import threading
-
-# 會話暫存：sid -> { "buf": bytearray, "started": ts, "last_push": ts, "sse_queue": asyncio.Queue }
-_STT_SESS = {}
-_STT_LOCK = threading.Lock()
-
-def _stt_new_session():
-    sid = uuid.uuid4().hex[:12]
-    with _STT_LOCK:
-        _STT_SESS[sid] = dict(
-            buf=bytearray(),
-            sse_queue=asyncio.Queue(maxsize=50),
-            closed=False
-        )
-    return sid
-
-def _stt_get(sid):
-    with _STT_LOCK:
-        return _STT_SESS.get(sid)
-
-def _stt_close(sid):
-    with _STT_LOCK:
-        s = _STT_SESS.get(sid)
-        if s: s["closed"] = True
-
-@app.post("/stt/begin")
-def stt_begin():
-    """
-    回傳一個 sid，ESP32 之後用這個 sid 連續上傳分片。
-    """
-    sid = _stt_new_session()
-    return {"ok": True, "sid": sid}
-
-@app.post("/stt/seg")
-async def stt_seg(request: Request, sid: str):
-    s = _stt_get(sid)
-    if not s: 
-        return JSONResponse({"ok": False, "err": "bad sid"}, status_code=400)
-
-    chunk = await request.body()
-    if not chunk:
-        return {"ok": True, "bytes": 0}
-
-    # 這裡收到的是「原始 PCM 16-bit mono @16kHz」
-    s["buf"].extend(chunk)
-
-    # ---- 閾值到就做一次「粗粒度」字幕（用累積到目前為止的 PCM，臨時包成 WAV 再丟 STT）----
-    MIN_BYTES_PER_PUSH = 16000 * 2 * 8 // 10  # ~0.8s
-    if len(s["buf"]) >= MIN_BYTES_PER_PUSH:
-        try:
-            wav_bytes = pcm16le_to_wav(bytes(s["buf"]), sr=16000)
-            # 用你目前載入的 provider 決定跑誰（local/openai 都支援）
-            if isinstance(stt_provider, STTProvider):
-                txt = stt_provider.transcribe(wav_bytes)
-            else:
-                txt = ""
-            # 推送 partial 到 SSE
-            try:
-                await s["sse_queue"].put(json.dumps({"partial": txt}))
-            except Exception:
-                pass
-        except Exception as e:
-            print("[stt_seg]", e)
-
-    return {"ok": True, "bytes": len(chunk)}
-
-
-@app.post("/stt/end")
-async def stt_end(sid: str):
-    s = _stt_get(sid)
-    if not s:
-        return JSONResponse({"ok": False, "err": "bad sid"}, status_code=400)
-
-    # 最終：把整段 PCM 包成 WAV 再丟 STT
-    try:
-        wav_bytes = pcm16le_to_wav(bytes(s["buf"]), sr=16000)
-        if isinstance(stt_provider, STTProvider):
-            text = stt_provider.transcribe(wav_bytes)
-        else:
-            text = ""
-    except Exception as e:
-        text = ""
-
-    # 推 final 到 SSE
-    try:
-        await s["sse_queue"].put(json.dumps({"final": text}))
-    except Exception:
-        pass
-    _stt_close(sid)
-
-    # 結合 LLM（保持你原本的一步到位設計）
-    reply = ""
-    try:
-        ctx = rag_provider.retrieve(text, k=RAG_TOP_K) if hasattr(rag_provider, "retrieve") else []
-        reply = llm_provider.chat(text, ctx, lang=REPLY_LANG)
-    except Exception as e:
-        print("[stt_end LLM]", e)
-
-    return {"ok": True, "text": text, "reply": reply}
-
-
-@app.get("/stt/sse")
-async def stt_sse(sid: str):
-    """
-    SSE: 對前端（你的 llm_panel 頁）推送即時字幕與結尾結果。
-    """
-    s = _stt_get(sid)
-    if not s:
-        return JSONResponse({"ok": False, "err": "bad sid"}, status_code=400)
-
-    async def eventgen():
-        # 先丟一個 hello
-        yield f"data: {json.dumps({'hello':'sse','sid':sid})}\n\n"
-        while True:
-            if s["closed"] and s["sse_queue"].empty():
-                break
-            try:
-                item = await asyncio.wait_for(s["sse_queue"].get(), timeout=1.5)
-                yield f"data: {item}\n\n"
-            except asyncio.TimeoutError:
-                continue
-        yield f"data: {json.dumps({'bye': True})}\n\n"
-
-    return StreamingResponse(eventgen(), media_type="text/event-stream")
-
-
-
