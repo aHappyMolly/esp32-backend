@@ -151,7 +151,6 @@ class OpenAIWhisperProvider(STTProvider):
             response_format="json"
         )
         # r.text 將是文字
-        print("voice to text")#10/31
         return r.text.strip()
 
 
@@ -573,6 +572,49 @@ def health():
                              hasattr(rag_provider, "chunks") and
                              len(getattr(rag_provider, "chunks", []))),
     }
+
+
+
+# --- main.py 追加：輕量預熱 ---
+from fastapi import BackgroundTasks
+from fastapi.responses import JSONResponse
+
+_warm_ready = False
+
+def _do_warm():
+    global _warm_ready
+    try:
+        # 觸發 RAG/LLM/TTS 供應器的 lazy init（皆為輕量呼叫）
+        try:
+            _ = getattr(rag_provider, "retrieve", lambda q, k=1: [])("hi", 1)
+        except Exception as e:
+            print("[warm] rag:", e)
+        try:
+            if llm_provider:
+                _ = llm_provider.chat("ping", [], lang="zh-TW")
+        except Exception as e:
+            print("[warm] llm:", e)
+        # 若你想連 TTS 也預熱，放開下面 3 行即可（會稍增冷啟時延）
+        # try:
+        #     if tts_provider:
+        #         _ = tts_provider.synth("hi", sr=16000)
+        # except Exception as e:
+        #     print("[warm] tts:", e)
+
+        _warm_ready = True
+    except Exception as e:
+        print("[warm] error:", e)
+
+@app.get("/warm")
+def warm(tasks: BackgroundTasks):
+    """非阻塞預熱；若尚未 ready，回 202 並在背景跑一次預熱。"""
+    global _warm_ready
+    if _warm_ready:
+        return {"ok": True, "ready": True}
+    tasks.add_task(_do_warm)
+    return JSONResponse({"ok": True, "ready": False}, status_code=202)
+
+
 
 # /stt：支援 multipart "file" 與 raw bytes（Content-Type: audio/wav）
 @app.post("/stt")
