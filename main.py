@@ -837,6 +837,65 @@ def rag_backup():
                              headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
+
+# ====== ⬇ 新增：WAV TTS 串流端點（單聲道 22050Hz） ======
+# 這裡示範：用你既有的 TTS 模組回傳「整段 wav bytes」後，再邊讀邊送。
+# 若你使用 OpenAI python sdk v1：
+#   audio_resp = client.audio.speech.with_streaming_response.create(
+#       model="gpt-4o-mini-tts", voice="alloy",
+#       input=text, format="wav", sample_rate=22050
+#   )
+#   再把 audio_resp.iter_bytes() 串出來即可。
+#
+# 下面給一個最簡單的「一次拿到 wav bytes」→ 包裝成 generator 的版本，
+# 你可以直接把 get_wav_bytes(text) 換成你的實作。
+
+def get_wav_bytes(text: str) -> bytes:
+    """
+    TODO: 用你的 TTS 取得 'wav (PCM16, mono, 22050Hz)' 原始位元組。
+    這裡先提供一個占位示例：回傳一段很短的無聲 wav（44-byte header + 0 data），方便你先跑通流程。
+    跑通後，請將此函式換成你實際的 TTS 產生 wav 的程式。
+    """
+    # 生成一個合法的 22050Hz mono 16-bit, 長度 0 的最小 WAV（僅示範）
+    # 你實作時應該回傳：wav_header + PCM資料
+    import struct
+    sample_rate = 22050
+    num_channels = 1
+    bits_per_sample = 16
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+    data = b""
+
+    # RIFF/WAVE header
+    riff = b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE"
+    fmt  = b"fmt " + struct.pack("<IHHIIHH", 16, 1, num_channels, sample_rate, byte_rate, block_align, bits_per_sample)
+    data_chunk = b"data" + struct.pack("<I", len(data)) + data
+    return riff + fmt + data_chunk
+
+@app.get("/tts_wav")
+def tts_wav(text: str = Query(..., description="要合成的文字")):
+    # 取得整段 wav bytes（先跑通，你再換成真 TTS）
+    wav_bytes = get_wav_bytes(text)
+
+    # 用 generator 邊送邊到 ESP；這裡先一次 yield 完整 wav_bytes
+    # 若你有真正串流（iter_bytes），可以逐塊 yield，前 44 bytes 先送 header，之後送 data
+    def gen():
+        CHUNK = 4096
+        mv = memoryview(wav_bytes)
+        for i in range(0, len(wav_bytes), CHUNK):
+            yield mv[i:i+CHUNK]
+
+    headers = {
+        "Content-Type": "audio/wav",
+        # 非必需，但對部分客戶端有幫助：
+        "Cache-Control": "no-store",
+        # 若能知道長度最好也回 Content-Length；不知長度也沒關係（chunked）
+        "Content-Length": str(len(wav_bytes)),
+        "Connection": "close",
+    }
+    return StreamingResponse(gen(), headers=headers)
+
+
 # ============= 開發啟動（直接 python main.py 時） =============
 if __name__ == "__main__":
     import uvicorn
