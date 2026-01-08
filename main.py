@@ -1,6 +1,6 @@
-# main.py —— 可切換 provider 的後端骨架 + /tts_wav 串流
-# 路由：/stt（語音→文字）、/chat（文字→RAG→LLM）、/tts（WAV 一次性）、/tts_wav（WAV 串流）、/tts_mp3（MP3 一次性）、/health
-# 用法：設定環境變數決定 STT / RAG / LLM / TTS 供應商，啟動：
+# main.py —— 可切換 provider 的後端骨架
+# 路由：/stt（語音→文字）、/chat（文字→RAG→LLM）、/health
+# 用法：設定環境變數決定 STT / RAG / LLM 供應商，然後啟動：
 #   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 import os
@@ -15,28 +15,29 @@ import zipfile, time
 from typing import List, Optional
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
-from fastapi import FastAPI, UploadFile, File, Request, HTTPException, Form, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Request, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, HTMLResponse, JSONResponse
+from app.tools.router import run_tools  # ← 新增 import
 from pathlib import Path
+from app.rag.loaders import (
+    read_text_file, extract_pdf_text, extract_docx_text, extract_url_text
+)
+from app.ui.rag_admin import mount_rag_admin
 from urllib.parse import urljoin
 
-# 你的工具與 RAG/管理頁（保留）
-from app.tools.router import run_tools
-from app.rag.loaders import (read_text_file, extract_pdf_text, extract_docx_text, extract_url_text)
-from app.ui.rag_admin import mount_rag_admin
+
 
 
 # ============= 環境參數（可在 PowerShell/cmd 或 .env 設定） =============
 # 供應商選項：
 #   STT:   "local"（faster-whisper）| "openai"
 #   RAG:   "local"（極簡檢索）| "openai"（OpenAI Embeddings）| "none"
-#   LLM:   "openai"
-#   TTS:   "openai" | "piper"
+#   LLM:   "openai"（建議；本地 LLM 之後可再擴充）
 PROVIDER_STT  = os.getenv("PROVIDER_STT",  "local")     # local | openai
 PROVIDER_RAG  = os.getenv("PROVIDER_RAG",  "none")      # local | openai | none
 PROVIDER_LLM  = os.getenv("PROVIDER_LLM",  "openai")    # openai
-PROVIDER_TTS  = os.getenv("PROVIDER_TTS",  "openai")    # openai | piper
+
 
 # Whisper（本地 STT）設定
 WHISPER_MODEL     = os.getenv("WHISPER_MODEL", "small") # tiny/base/small/medium/large-v3 ...
@@ -48,31 +49,32 @@ OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_EMBED_MODEL= os.getenv("EMBED_MODEL", "text-embedding-3-small")
 OPENAI_STT_MODEL  = os.getenv("OPENAI_STT_MODEL", "whisper-1")  # 或 gpt-4o-mini-transcribe
-OPENAI_BASE_URL   = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
 # RAG 知識來源（會讀這個資料夾下的 .txt/.md/.mdx/.html 檔）
 KNOWLEDGE_DIR     = os.getenv("KNOWLEDGE_DIR", "./knowledge")
 RAG_TOP_K         = int(os.getenv("RAG_TOP_K", "4"))
 
 # 語言偏好（繁體）
-LANG_HINT         = os.getenv("LANG_HINT", "zh")
-REPLY_LANG        = os.getenv("REPLY_LANG", "zh-TW")
+LANG_HINT         = os.getenv("LANG_HINT", "zh")     # STT 語言提示
+REPLY_LANG        = os.getenv("REPLY_LANG", "zh-TW") # LLM 回覆語言偏好
 
-# TTS 設定
-OPENAI_TTS_MODEL  = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
-OPENAI_TTS_VOICE  = os.getenv("OPENAI_TTS_VOICE", "alloy")
-PIPER_MODEL_PATH  = os.getenv("PIPER_MODEL_PATH", "")  # 例：/models/zh_CN-piper-medium.onnx
+# TTS 設定（NEW）
+PROVIDER_TTS   = os.getenv("PROVIDER_TTS", "openai")  # openai | piper
+OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")  # OpenAI TTS 型號
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy")            # 聲音樣式
+PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "")  # 例：/models/zh_CN-piper-medium.onnx
 
 
 # ============= FastAPI 初始化與 CORS =============
-app = FastAPI(title="ESP32 Voice Backend (Pluggable)", version="1.1")
+app = FastAPI(title="ESP32 Voice Backend (Pluggable)", version="1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"]
 )
 
-# mount RAG admin
+# 只是註冊一個 /rag 的 GET 路由 ( app 已存在 → rag_admin)
 mount_rag_admin(app)
 
 
@@ -88,11 +90,13 @@ class RAGProvider:
 class LLMProvider:
     def chat(self, user_text: str, context_chunks: List[str], lang: str = "zh-TW") -> str:
         raise NotImplementedError
-
+    
 class TTSProvider:
     def synth(self, text: str, sr: int = 16000) -> bytes:
         """回傳整段 WAV（bytes）。"""
         raise NotImplementedError
+    
+
 
 
 # ============= STT Providers =============
@@ -102,11 +106,12 @@ class LocalWhisperProvider(STTProvider):
         from faster_whisper import WhisperModel
         self.model = WhisperModel(
             WHISPER_MODEL,
-            device=WHISPER_DEVICE,
-            compute_type=WHISPER_COMPUTE
+            device=WHISPER_DEVICE,         # "cuda" or "cpu"
+            compute_type=WHISPER_COMPUTE   # "float16" 等
         )
 
     def transcribe(self, audio_bytes: bytes) -> str:
+        # faster-whisper 最穩吃檔案路徑 → 先落地暫存檔
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp.write(audio_bytes)
             path = tmp.name
@@ -133,19 +138,26 @@ class OpenAIWhisperProvider(STTProvider):
 
     def transcribe(self, audio_bytes: bytes) -> str:
         from tempfile import NamedTemporaryFile
+        # OpenAI SDK 需要 file-like；這裡也走暫存檔
         with NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp.write(audio_bytes)
             tmp_path = tmp.name
+        # whisper-1：傳統 Whisper；若用 gpt-4o-mini-transcribe 需依官方語音API更新
         r = self.client.audio.transcriptions.create(
             model=OPENAI_STT_MODEL,
             file=open(tmp_path, "rb"),
+            # 若要強制 zh，可用 language="zh"
+            # language="zh",
             response_format="json"
         )
+        # r.text 將是文字
         return r.text.strip()
 
 
 # ============= RAG Providers =============
+
 def _load_documents_from_dir(path: str) -> List[str]:
+    """讀取 knowledge 中的各類文件 → 純文字 → 簡單切塊"""
     chunks: List[str] = []
     exts = [".txt", ".md", ".mdx", ".html", ".htm", ".pdf", ".docx"]
     for p in Path(path).rglob("*"):
@@ -164,6 +176,7 @@ def _load_documents_from_dir(path: str) -> List[str]:
         if not (text and text.strip()):
             continue
 
+        # --- 你的原本切塊策略（每塊 ≤800 字） ---
         for para in text.splitlines():
             t = (para or "").strip()
             if not t:
@@ -175,15 +188,21 @@ def _load_documents_from_dir(path: str) -> List[str]:
                 chunks.append(t)
     return chunks
 
+    # --- 若未來要 OCR 掃描版 PDF：在 extract_pdf_text 中偵測 page.images，必要時切圖丟 pytesseract
+
+
+# --- 圖片建議：從工具來源 URL 抓 og:image + 從 knowledge/.meta.json 挑關鍵圖 ---
+# 即使目前的 RAG chunk 沒帶「來源檔名」，也可先用「工具來源 URL」與「knowledge 的 .meta.json」來挑圖
 def _images_from_tool_sources(sources, max_n=3):
     imgs = []
     for s in sources or []:
         url = (s.get("url") if isinstance(s, dict) else None) or ""
-        if not url or not url.startswith("http"):
+        if not url or not url.startswith("http"): 
             continue
         try:
             r = requests.get(url, timeout=6, headers={"User-Agent":"Mozilla/5.0"})
             html = r.text
+            # og:image
             m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
             if m:
                 img = m.group(1).strip()
@@ -196,11 +215,14 @@ def _images_from_tool_sources(sources, max_n=3):
             break
     return imgs
 
+# 取代 main.py 內的 _images_from_meta_by_query
 def _images_from_meta_by_query(query: str, max_n=3):
+    """掃描 knowledge/*.meta.json，若 title/url/tags 有任何 token 命中，就收集 image/images。"""
     def _tokens(s: str):
         s = (s or "").lower().strip()
         out, buf = [], []
         for ch in s:
+            # 中文：逐字；英文數字：聚成詞
             if "\u4e00" <= ch <= "\u9fff":
                 if buf: out.append("".join(buf)); buf=[]
                 out.append(ch)
@@ -209,10 +231,13 @@ def _images_from_meta_by_query(query: str, max_n=3):
             else:
                 if buf: out.append("".join(buf)); buf=[]
         if buf: out.append("".join(buf))
+        # 過濾太短的英文 token
         return [t for t in out if (len(t)>=2 or ("\u4e00"<=t<= "\u9fff"))]
+
     q_tokens = _tokens(query)
     if not q_tokens:
         return []
+
     out = []
     root = Path(KNOWLEDGE_DIR)
     for m in root.glob("*.meta.json"):
@@ -220,18 +245,24 @@ def _images_from_meta_by_query(query: str, max_n=3):
             meta = json.loads(m.read_text(encoding="utf-8"))
         except Exception:
             continue
+
         hay = " ".join([
             str(meta.get("title","")),
             str(meta.get("url","")),
             " ".join(meta.get("tags",[])),
         ]).lower()
+
+        # 只要任一 token 出現在 title/url/tags 就視為命中
         if any(tok in hay for tok in q_tokens):
             if meta.get("image"):
                 out.append(meta["image"])
             if isinstance(meta.get("images"), list):
                 out.extend([x for x in meta["images"] if isinstance(x, str)])
+
         if len(out) >= max_n:
             break
+
+    # 去重、限量
     seen, uniq = set(), []
     for u in out:
         if u not in seen:
@@ -239,9 +270,13 @@ def _images_from_meta_by_query(query: str, max_n=3):
     return uniq[:max_n]
 
 
+
+
+# A) local RAG（免外部依賴的極簡檢索：tf-idf-like + overlap 分數）
 class LocalNaiveRAG(RAGProvider):
     def __init__(self, knowledge_dir: str):
         self.chunks = _load_documents_from_dir(knowledge_dir)
+        # 建一些輕量索引（word -> df）
         self.N = len(self.chunks)
         self.df = {}
         for c in self.chunks:
@@ -250,6 +285,7 @@ class LocalNaiveRAG(RAGProvider):
                 self.df[t] = self.df.get(t, 0) + 1
 
     def _tokenize(self, s: str) -> List[str]:
+        # 極簡 token（中文：逐字；英文：小寫拆詞）；可換 jieba 等
         out = []
         buf = []
         for ch in s:
@@ -268,6 +304,7 @@ class LocalNaiveRAG(RAGProvider):
         if not self.chunks:
             return []
         q_tokens = self._tokenize(query)
+        # tf-idf like：sum( tf * idf ) + 字元重疊 bonus
         def score(text: str) -> float:
             tokens = self._tokenize(text)
             tf = {}
@@ -277,11 +314,13 @@ class LocalNaiveRAG(RAGProvider):
             for t in q_tokens:
                 idf = math.log((self.N + 1) / (1 + self.df.get(t, 0) )) + 1.0
                 s += tf.get(t, 0) * idf
+            # 加一點字元重疊度
             overlap = len(set(query) & set(text)) / (len(set(query)) + 1e-6)
             return s + overlap
         ranked = sorted(self.chunks, key=score, reverse=True)
         return ranked[:k]
 
+# B) openai RAG（用 OpenAI Embeddings 做簡單向量檢索；向量存記憶體）
 class OpenAIRAG(RAGProvider):
     def __init__(self, knowledge_dir: str):
         if not OPENAI_API_KEY:
@@ -293,6 +332,7 @@ class OpenAIRAG(RAGProvider):
         self.vecs = self._embed_batch(self.chunks) if self.chunks else []
 
     def _embed_batch(self, texts: List[str]) -> List[List[float]]:
+        # OpenAI embeddings：一次可送多筆
         r = self.client.embeddings.create(model=self.model, input=texts)
         return [d.embedding for d in r.data]
 
@@ -343,15 +383,16 @@ class OpenAILLM(LLMProvider):
             max_tokens=300,
         )
         return r.choices[0].message.content.strip()
-
+    
 
 # ============= TTS Provider（NEW） =============
-# A) OpenAI TTS（雲端）
+# A) OpenAI TTS（雲端，最簡單）
+
 class OpenAITTSProvider(TTSProvider):
     def __init__(self):
         if not OPENAI_API_KEY:
             raise RuntimeError("OPENAI_API_KEY missing for OpenAI TTS")
-        import requests
+        import requests  # 確保 requirements.txt 有 requests
         self.requests = requests
         self.model  = OPENAI_TTS_MODEL or "gpt-4o-mini-tts"
         self.voice  = OPENAI_TTS_VOICE or "alloy"
@@ -365,6 +406,7 @@ class OpenAITTSProvider(TTSProvider):
         payload = {"model": self.model, "voice": self.voice, "input": text, "format": "wav", "sample_rate": int(sr)}
         r = self.requests.post(self.base, headers=self.headers, json=payload, timeout=60)
         if r.status_code == 400:
+            # 某些模型/版本不接受 sample_rate，移除後重試
             payload.pop("sample_rate", None)
             r = self.requests.post(self.base, headers=self.headers, json=payload, timeout=60)
         if r.status_code != 200:
@@ -374,23 +416,34 @@ class OpenAITTSProvider(TTSProvider):
             raise RuntimeError("TTS returned non-WAV")
         return b
 
+
+
+
+
 # B) Piper（本地，離線）
 class PiperTTSProvider(TTSProvider):
     def __init__(self):
         if not PIPER_MODEL_PATH or not os.path.exists(PIPER_MODEL_PATH):
             raise RuntimeError("Piper model not found; set PIPER_MODEL_PATH")
+        # 依你安裝的封裝而定，以下示意常見 API
+        # pip install piper-phonemize piper-tts 或相容套件
         from piper import PiperVoice
         self.voice = PiperVoice.load(PIPER_MODEL_PATH)
 
     def synth(self, text: str, sr: int = 16000) -> bytes:
+        # Piper 預設會回 PCM/或直接寫檔；這裡將其包成 WAV
         import wave, struct
         import numpy as np
-        pcm = self.voice.synthesize(text, length_scale=1.0)  # 可能回 float32
+        # 產生 16-bit mono PCM（numpy int16）
+        pcm = self.voice.synthesize(text, length_scale=1.0)  # 取得 float32 PCM（依套件版本不同）
         if pcm.dtype != np.int16:
+            # 轉 16-bit（簡單限幅）
             x = np.clip(pcm, -1.0, 1.0)
             pcm16 = (x * 32767.0).astype(np.int16)
         else:
             pcm16 = pcm
+
+        # 封裝 WAV（16-bit mono）
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
@@ -400,7 +453,8 @@ class PiperTTSProvider(TTSProvider):
         return buf.getvalue()
 
 
-# ============= 小工具：產生 beep WAV =============
+# ============= 加入一個產生 beep WAV 的小工具 =============
+# --- fallback: 產生一段 0.8 秒 1kHz 的 16-bit mono WAV ---
 def make_beep_wav(sr: int = 16000, dur_s: float = 0.8, freq: float = 1000.0) -> bytes:
     import math, io, wave, struct
     n = int(sr * dur_s)
@@ -416,8 +470,12 @@ def make_beep_wav(sr: int = 16000, dur_s: float = 0.8, freq: float = 1000.0) -> 
     return buf.getvalue()
 
 
-# =============== RAG 上傳與載入 ================
+
+# =============== RAG 上傳相關 ================
+
+# 重建索引 ( 讓相關 API 可以呼叫它重整 RAG)
 def _reload_rag_provider():
+    """重新載入 RAG（依照目前 PROVIDER_RAG），以便上傳/新增網址後立即生效。"""
     global rag_provider
     if PROVIDER_RAG == "local":
         rag_provider = LocalNaiveRAG(KNOWLEDGE_DIR)
@@ -426,6 +484,8 @@ def _reload_rag_provider():
     elif PROVIDER_RAG == "none":
         rag_provider = RAGProvider()
 
+
+# 列出 knowledge 目錄檔案（給 /rag/list 用）
 def _list_knowledge_files():
     root = Path(KNOWLEDGE_DIR)
     root.mkdir(parents=True, exist_ok=True)
@@ -440,6 +500,7 @@ def _list_knowledge_files():
                 "ext": p.suffix.lower(),
             })
     return items
+
 
 
 # ============= Provider 載入器 =============
@@ -466,7 +527,7 @@ def load_providers():
     elif PROVIDER_RAG == "openai":
         rag_provider = OpenAIRAG(KNOWLEDGE_DIR)
     elif PROVIDER_RAG == "none":
-        rag_provider = RAGProvider()
+        rag_provider = RAGProvider()  # 空實作，retrieve() 回 []
     else:
         raise RuntimeError(f"Unknown PROVIDER_RAG: {PROVIDER_RAG}")
 
@@ -476,13 +537,15 @@ def load_providers():
     else:
         raise RuntimeError(f"Unknown PROVIDER_LLM: {PROVIDER_LLM}")
 
-    # TTS
+    # TTS（NEW）
     if PROVIDER_TTS == "openai":
         tts_provider = OpenAITTSProvider()
     elif PROVIDER_TTS == "piper":
         tts_provider = PiperTTSProvider()
     else:
         raise RuntimeError(f"Unknown PROVIDER_TTS: {PROVIDER_TTS}")
+    
+
 
 
 # ============= 路由 =============
@@ -511,11 +574,17 @@ def health():
     }
 
 
-# --- 輕量預熱 ---
+
+# --- main.py 追加：輕量預熱 ---
+from fastapi import BackgroundTasks
+from fastapi.responses import JSONResponse
+
 _warm_ready = False
+
 def _do_warm():
     global _warm_ready
     try:
+        # 觸發 RAG/LLM/TTS 供應器的 lazy init（皆為輕量呼叫）
         try:
             _ = getattr(rag_provider, "retrieve", lambda q, k=1: [])("hi", 1)
         except Exception as e:
@@ -525,17 +594,26 @@ def _do_warm():
                 _ = llm_provider.chat("ping", [], lang="zh-TW")
         except Exception as e:
             print("[warm] llm:", e)
+        # 若你想連 TTS 也預熱，放開下面 3 行即可（會稍增冷啟時延）
+        # try:
+        #     if tts_provider:
+        #         _ = tts_provider.synth("hi", sr=16000)
+        # except Exception as e:
+        #     print("[warm] tts:", e)
+
         _warm_ready = True
     except Exception as e:
         print("[warm] error:", e)
 
 @app.get("/warm")
 def warm(tasks: BackgroundTasks):
+    """非阻塞預熱；若尚未 ready，回 202 並在背景跑一次預熱。"""
     global _warm_ready
     if _warm_ready:
         return {"ok": True, "ready": True}
     tasks.add_task(_do_warm)
     return JSONResponse({"ok": True, "ready": False}, status_code=202)
+
 
 
 # /stt：支援 multipart "file" 與 raw bytes（Content-Type: audio/wav）
@@ -558,26 +636,31 @@ async def stt(file: Optional[UploadFile] = File(None), request: Request = None):
 
 class ChatIn(BaseModel):
     text: str
-    device_context: Optional[dict] = None
+    device_context: Optional[dict] = None   # ← 允許前端附座標/時區
 
 @app.post("/chat")
 def chat(body: ChatIn):
     if llm_provider is None or rag_provider is None:
         raise HTTPException(500, "Providers not loaded")
     try:
-        tool_chunks, tool_sources = run_tools(body.text, body.device_context)
+        tool_chunks, tool_sources = run_tools(body.text, body.device_context)  # ← 新增
         rag_chunks = rag_provider.retrieve(body.text, k=RAG_TOP_K) if hasattr(rag_provider, "retrieve") else []
         chunks = tool_chunks + rag_chunks
+
         reply  = llm_provider.chat(body.text, chunks, lang=REPLY_LANG)
+
         images_a = _images_from_tool_sources(tool_sources, max_n=3)
         images_b = _images_from_meta_by_query(body.text, max_n=3)
         images = (images_a + images_b)[:3]
+
         return {"ok": True, "reply": reply, "ctx_used": len(chunks), "sources": tool_sources, "images": images}
+
     except Exception as e:
         raise HTTPException(500, f"Chat error: {e}")
+    
 
 
-# ====== 既有 TTS（一次性回傳整段 WAV） ======
+
 class TTSIn(BaseModel):
     text: str
     sr: Optional[int] = 16000
@@ -589,9 +672,11 @@ def tts(body: TTSIn):
         raise HTTPException(400, "empty text")
     sr = int(body.sr or 16000)
 
+    # 先預備一個 resp 物件，方便附加 header
     out_bytes: bytes = b""
     impl = "rest"
     err  = ""
+
     try:
         if tts_provider is None:
             impl = "beep"
@@ -609,88 +694,24 @@ def tts(body: TTSIn):
         resp.headers["X-TTS-Error"] = err[:300]
     return resp
 
+# （可選）GET /tts 方便瀏覽器測
 @app.get("/tts")
 def tts_get(text: Optional[str] = "", sr: Optional[int] = 16000):
     t = (text or "").strip() or "系統測試音"
     return tts(TTSIn(text=t, sr=sr))
 
 
-# ====== 新增：WAV 串流端點（ESP32 直串 I2S 用） ======
-# 說明：
-# 1) 優先使用 OpenAI SDK 的 with_streaming_response，逐塊產生 WAV bytes → StreamingResponse。
-# 2) 若發生錯誤（權限/模型/網路），回退到 tts_provider.synth() 一次性拿到整段 WAV，仍以 chunked 形式回傳。
-@app.get("/tts_wav")
-def tts_wav(text: str, sr: int = 22050):
-    t = (text or "").strip()
-    if not t:
-        raise HTTPException(400, "empty text")
-
-    # 嘗試：OpenAI streaming（僅當 PROVIDER_TTS=openai 且有 API key）
-    if PROVIDER_TTS == "openai" and OPENAI_API_KEY:
-        try:
-            from openai import OpenAI
-            client = OpenAI()
-            # 有些版本對 sample_rate 嚴格；先嘗試帶 sr，失敗再不帶
-            def _stream_req(with_sr=True):
-                kwargs = dict(model=OPENAI_TTS_MODEL or "gpt-4o-mini-tts",
-                              voice=OPENAI_TTS_VOICE or "alloy",
-                              input=t,
-                              format="wav")
-                if with_sr:
-                    kwargs["sample_rate"] = int(sr)
-                return client.audio.speech.with_streaming_response.create(**kwargs)
-
-            try:
-                resp = _stream_req(with_sr=True)
-            except Exception:
-                resp = _stream_req(with_sr=False)
-
-            def gen():
-                with resp as r:
-                    for chunk in r.iter_bytes():
-                        yield chunk
-            # 不提供 Content-Length（chunked）；ESP32 端 HTTPClient 可邊收邊播
-            return StreamingResponse(gen(), media_type="audio/wav",
-                                     headers={"Cache-Control": "no-store", "Connection": "close"})
-        except Exception as e:
-            # 失敗則落回一次性
-            pass
-
-    # 回退：一次性 WAV（仍用 StreamingResponse 包裝）
-    try:
-        if tts_provider is not None:
-            data = tts_provider.synth(t, sr=sr)
-        else:
-            data = make_beep_wav(sr=sr, dur_s=0.6, freq=800.0)
-        # 提供 Content-Length 對部分客戶端更穩
-        return Response(
-            content=data,
-            media_type="audio/wav",
-            headers={
-                "Content-Length": str(len(data)),
-                "Cache-Control": "no-store",
-                "Connection": "close",
-            },
-        )
-    except Exception as e:
-        # 最後保底：回短 beep，避免前端卡死
-        beep = make_beep_wav(sr=sr, dur_s=0.5, freq=600.0)
-        return Response(
-            content=beep,
-            media_type="audio/wav",
-            headers={"X-TTS-Error": str(e)[:200], "Connection": "close"},
-        )
-
-
-# ====== MP3（一次性）仍保留，給需要 MP3 播放器的客戶端 ======
 @app.get("/tts_mp3")
 def tts_mp3(text: str = "", voice: str = "alloy"):
+    """回 MP3（audio/mpeg），給 ESP32-S3 + ESP8266Audio 直接串流播放。"""
     t = (text or "").strip()
     if not t:
         raise HTTPException(400, "empty text")
+
     if not OPENAI_API_KEY:
         raise HTTPException(500, "OPENAI_API_KEY missing")
 
+    import requests
     url = "https://api.openai.com/v1/audio/speech"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -700,12 +721,16 @@ def tts_mp3(text: str = "", voice: str = "alloy"):
         "model": OPENAI_TTS_MODEL or "gpt-4o-mini-tts",
         "voice": voice or (OPENAI_TTS_VOICE or "alloy"),
         "input": t,
-        "format": "mp3",
+        "format": "mp3",          # ★ 要 MP3
+        # MP3 自帶採樣率，通常不指定 sample_rate
     }
+
     r = requests.post(url, headers=headers, json=payload, timeout=60)
     if r.status_code != 200:
         raise HTTPException(500, f"TTS failed: {r.status_code} {r.text[:200]}")
+
     b = r.content
+    # 明確告知長度與關閉連線 → ESP32 串流更穩
     return Response(
         content=b,
         media_type="audio/mpeg",
@@ -717,23 +742,34 @@ def tts_mp3(text: str = "", voice: str = "alloy"):
     )
 
 
-# =============== RAG 檔案/網址 ========
+
+# 方便把資料丟進 RAG ( 上傳檔案 → 存進 knowledge → 重新索引 )
 @app.post("/rag/upload")
 async def rag_upload(file: UploadFile = File(...)):
+    """支援 .txt .md .html .pdf .docx，上傳後存進 knowledge/ 原檔名，並重建索引。"""
     suf = Path(file.filename).suffix.lower()
     if suf not in [".txt", ".md", ".mdx", ".html", ".htm", ".pdf", ".docx"]:
         raise HTTPException(400, "Unsupported file type")
+
+    # 保存到 knowledge/
     dst = Path(KNOWLEDGE_DIR) / Path(file.filename).name
     dst.parent.mkdir(parents=True, exist_ok=True)
     data = await file.read()
     dst.write_bytes(data)
+
+    # 重建索引
     _reload_rag_provider()
+
     return {"ok": True, "saved": str(dst.name), "chunks": len(getattr(rag_provider, "chunks", []))}
 
+
+# 方便把資料丟進 RAG (加入網址 → 轉文字 → 存成 .txt → 重新索引)
 @app.post("/rag/add_url")
 async def rag_add_url(url: str = Form(...)):
+    """把網址主要內文抓下來，存成 .txt 到 knowledge，並重建索引。"""
     text = extract_url_text(url)
     if not text or not text.strip():
+        # 加強除錯：在伺服器日誌印一次，前端看到 400 但你可在後端查看是哪個 URL 抓不到
         print(f"[rag_add_url] extract failed: {url}")
         raise HTTPException(400, "Failed to extract text from URL (no text)")
     safe = "".join(ch for ch in url if ch.isalnum() or ch in "-_").strip("-_")[:60] or "page"
@@ -741,6 +777,7 @@ async def rag_add_url(url: str = Form(...)):
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(text, encoding="utf-8")
 
+    # 擷取 title 與 og:image，寫同名 meta 檔
     title = ""; og_image = ""
     try:
         r = requests.get(url, timeout=6, headers={"User-Agent":"Mozilla/5.0"})
@@ -756,8 +793,12 @@ async def rag_add_url(url: str = Form(...)):
     (Path(KNOWLEDGE_DIR) / f"{safe}.txt.meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
     _reload_rag_provider()
     return {"ok": True, "saved": dst.name, "chars": len(text), "chunks": len(getattr(rag_provider, "chunks", []))}
+
+
 
 @app.get("/rag/list")
 def rag_list():
@@ -765,6 +806,7 @@ def rag_list():
 
 @app.post("/rag/delete")
 def rag_delete(name: str = Form(...)):
+    """刪除 knowledge 內指定檔案，並重建索引。"""
     root = Path(KNOWLEDGE_DIR).resolve()
     target = (root / name).resolve()
     if not str(target).startswith(str(root)) or not target.exists() or not target.is_file():
@@ -775,9 +817,12 @@ def rag_delete(name: str = Form(...)):
 
 @app.post("/rag/reindex")
 def rag_reindex():
+    """手動重建索引。"""
     _reload_rag_provider()
     return {"ok": True, "chunks": len(getattr(rag_provider, "chunks", []))}
 
+
+# RAG 從管理頁上傳後，再打包下載，把線上內容拉回本機備份 
 @app.get("/rag/backup")
 def rag_backup():
     buf = io.BytesIO()
